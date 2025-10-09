@@ -1,0 +1,33 @@
+#!/bin/sh -x
+
+if [ $# -eq 1 ]
+then 
+	install=1
+else
+	install=0
+fi
+
+set -x
+cc -I. -D_KERNEL -DSYSV -DSVR40 -DAT386 -DVPIX -DWEITEK -DMERGE386 -DBLTCONS -DEVGA -c ata_core.c
+cc -I. -D_KERNEL -DSYSV -DSVR40 -DAT386 -DVPIX -DWEITEK -DMERGE386 -DBLTCONS -DEVGA -c ata_hw.c
+cc -I. -D_KERNEL -DSYSV -DSVR40 -DAT386 -DVPIX -DWEITEK -DMERGE386 -DBLTCONS -DEVGA -c ata_queue.c
+ld -r -o Driver.o ata_core.o ata_hw.o ata_queue.o
+
+echo "Installing Driver and space.c"
+mkdir -p /etc/conf/pack.d/ata 2>/dev/null
+cp Driver.o /etc/conf/pack.d/ata/
+cp ID/Space.c /etc/conf/pack.d/ata/space.c
+
+if [ $install -eq 1 ]
+then
+	echo "Install System and Master files as well"
+	cp ID/ata.Sdev /etc/conf/sdevice.d/ata
+	cp ID/ata.Mdev /etc/conf/mdevice.d/ata
+	cp /etc/conf/cf.d/mdevice /etc/conf/cf.d/mdevice.RC
+	ed /etc/conf/cf.d/mdevice << EOF
+/^ata[	 ]/d
+r ID/ata.Mdev
+w
+q
+EOF
+fi
