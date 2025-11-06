@@ -4,174 +4,30 @@
 
 #include "ata.h"
 
-void
-ata_program_taskfile(ata_ctrl_t *ac, ata_req_t *r)
-{
-	ata_ioque_t *que = ac->ioque;
-	u32_t lba    = r->lba_cur;
-	u8_t  drive  = r->drive & 1;
-	u8_t  cmd    = r->cmd;
-	u16_t todo   = (r->nsec == 0) ? 256 : ((r->nsec>256) ? 256 : r->nsec);
-	u8_t  sc     = (todo == 256) ? 0 : todo;
-	u8_t 	ast, err;
-	int	er;
-
-	switch (cmd) {
-	case ATA_CMD_READ_SEC:
-		ata_sel(ac, drive, lba);
-		er=ata_err(ac,&ast,&err);
-		ATADEBUG(9,"ata_program_taskfile(): DH=%02x SC=%02x L=%02x %02x %02x ST=%02x\n",
-		drive,sc,(u8_t)(lba),(u8_t)(lba>>8),(u8_t)(lba>>16),ast);
-		outb(ATA_SECTCNT_O(ac), sc);
-		outb(ATA_LBA0_O(ac),    (u8_t)(lba      ));
-		outb(ATA_LBA1_O(ac),    (u8_t)(lba >>  8));
-		outb(ATA_LBA2_O(ac),    (u8_t)(lba >> 16));
-		outb(ATA_CMD_O(ac), cmd);
-		ata_delay400(ac);
-		return;
-
-	case ATA_CMD_WRITE_SEC:
-		ata_sel(ac, drive, lba);
-		er=ata_err(ac,&ast,&err);
-		ATADEBUG(9,"ata_program_taskfile(): DH=%02x SC=%02x L=%02x %02x %02x ST=%02x\n",
-		drive,sc,(u8_t)(lba),(u8_t)(lba>>8),(u8_t)(lba>>16),ast);
-		outb(ATA_SECTCNT_O(ac), sc);
-		outb(ATA_LBA0_O(ac),    (u8_t)(lba      ));
-		outb(ATA_LBA1_O(ac),    (u8_t)(lba >>  8));
-		outb(ATA_LBA2_O(ac),    (u8_t)(lba >> 16));
-		outb(ATA_CMD_O(ac), cmd);
-
-		{ /*** PRIME WRITES ***/
-		if (ata_wait(ac,ATA_ST_DRQ,ATA_ST_BSY,1000000) != 0) {
-			er=ata_err(ac,&ast,&err);
-			ATADEBUG(9,"ST=%02x ERR=%02x\n",ast,err);
-			if (!(ast & ATA_ST_DRQ)) {
-				printf("WRITE: DRQ never asserted\n");
-				return;
-			}
-		}
-
-		pio_one_sector(ac,drive,1);
-		
-		que->xptr += 512;
-		r->xfer_off += 512;
-		if (r->chunk_left)   r->chunk_left--;
-		if (r->sectors_left) r->sectors_left--;
-		}
-		ata_delay400(ac);
-		return;
-
-	case ATA_CMD_IDENTIFY:
-	case ATA_CMD_IDENTIFY_PKT:
-		ata_sel(ac, drive, 0);
-		outb(ATA_SECTCNT_O(ac), 0);
-		outb(ATA_LBA0_O(ac),    0);
-		outb(ATA_LBA1_O(ac),    0);
-		outb(ATA_LBA2_O(ac),    0);
-		outb(ATA_CMD_O(ac), cmd);
-		ata_delay400(ac);
-		return;
-
-	case ATA_CMD_PACKET:
-		ata_sel(ac, drive, 0);
-		outb(ATA_FEAT_O(ac),    0x00);
-		outb(ATA_SECTCNT_O(ac), 0x00);
-		outb(ATA_LBA0_O(ac),    0x00);
-		outb(ATA_LBA1_O(ac),    (u8_t)(r->atapi_bytes      & 0xFF));
-		outb(ATA_LBA2_O(ac),    (u8_t)((r->atapi_bytes>>8) & 0xFF));
-		outb(ATA_CMD_O(ac), cmd);
-		ata_delay400(ac);
-		return;
-
-	default:
-		ata_sel(ac, drive, 0);
-		outb(ATA_SECTCNT_O(ac), 0);
-		outb(ATA_LBA0_O(ac),    0);
-		outb(ATA_LBA1_O(ac),    0);
-		outb(ATA_LBA2_O(ac),    0);
-		outb(ATA_CMD_O(ac), cmd);
-		ata_delay400(ac);
-		return;
-	}
-}
-
-void 
-ata_program_next_chunk(ata_ctrl_t *ac, ata_req_t *r,int arm_ticks)
-{
-	ata_ioque_t *que = ac->ioque;
-	u32_t	n;
-	u8_t	ast;
-	int	er;
-	caddr_t	user_ptr;
-	size_t 	bytes;
-
-	ATADEBUG(1,"ata_program_next_chunk()\n");
-	if (!r) return;
-
-	n = (r->sectors_left > 256U) ? 256U : r->sectors_left;
-	if (n == 0) return;
-
-	bytes = (size_t)n << 9; /* * 512U */
-	user_ptr = (caddr_t)((u8_t *)r->addr + r->xfer_off);
-
-	if (r->is_write) {
-		if (que->xfer_buf) {
-			bcopy(user_ptr,que->xfer_buf,bytes);
-			que->xptr = que->xfer_buf;
-		} else {
-			que->xptr = user_ptr;
-		}
-	} else {
-		if (que && que->xfer_buf) {
-			que->xptr = que->xfer_buf;
-			r->flags |= ATA_RF_NEEDCOPY;
-		} else {
-			que->xptr = user_ptr;
-			r->flags &= ~ATA_RF_NEEDCOPY;
-		}
-	}
-
-	que->state = AS_PRIMED;
-
-	r->chunk_left   = (u16_t)n;
-	r->chunk_bytes  = (u32_t)bytes;
-	r->lba_cur 	= r->lba + (r->xfer_off >> 9);
-	r->nsec	      	= (u16_t)n;
-	r->cmd	      	= r->is_write ? ATA_CMD_WRITE_SEC : ATA_CMD_READ_SEC;
-
-	ATADEBUG(5,"%s: ata_program_next_chunk(%s) blk=%lu count=%lu\n",
-		CCstr(ac),r->is_write?"Write":"Read",r->lba_cur,n);
-
-	ata_program_taskfile(ac, r);
-	if (arm_ticks) ata_arm_watchdog(ac,arm_ticks);
-}
-
 void 
 ata_arm_watchdog(ata_ctrl_t *ac, int ticks)
 {
-	ata_ioque_t *que = ac->ioque;
+	ATADEBUG(5,"%s: ata_arm_watchdog(%d)\n", Cstr(ac), ticks);
 
 	if (ticks <= 0)
-		ticks = (que->tmo_ticks ? que->tmo_ticks : 2*HZ);
-	if (que->tmo_id) {
-		untimeout(que->tmo_id);
-		que->tmo_id = 0;
+		ticks = (ac->tmo_ticks ? ac->tmo_ticks : 2*HZ);
+	if (ac->tmo_id) {
+		untimeout(ac->tmo_id);
+		ac->tmo_id = 0;
 	}
 	BUMP(ac,wd_arm);
-	que->tmo_id = timeout(ata_watchdog, (caddr_t)ac, ticks);
-	ATADEBUG(5,"%s: ata_arm_watchdog(%d)\n", CCstr(ac), ticks);
+	ac->tmo_id = timeout(ata_watchdog, (caddr_t)ac, ticks);
 }
 
 void 
 ata_cancel_watchdog(ata_ctrl_t *ac)
 {
-	ata_ioque_t *que = ac->ioque;
+	ATADEBUG(5,"%s: ata_cancel_watchdog()\n", Cstr(ac));
 
-	if (que->tmo_id) {
+	if (ac->tmo_id) {
 		BUMP(ac,wd_cancel);
-		untimeout(que->tmo_id);
-		que->tmo_id = 0;
-		ATADEBUG(5,"%s: ata_cancel_watchdog()\n", CCstr(ac));
+		untimeout(ac->tmo_id);
+		ac->tmo_id = 0;
 	}
 }
 
@@ -179,172 +35,141 @@ void
 ata_watchdog(caddr_t arg)
 {
 	ata_ctrl_t *ac = (ata_ctrl_t *)arg;
-	ata_ioque_t *que = ac->ioque;
-	ata_req_t  *r  = que ? que->cur : NULL;
-	int	s, REKICK_LIMIT=8, er;
-	u8_t 	ast, st, err;
+	ata_ioque_t *q = ac ? ac->ioque : NULL;
+	ata_req_t   *r = q ? q->cur : NULL;
+	int	s, er, progress=0;
+	u8_t 	ast, err;
 
-	if (!r) { que->tmo_id=0; return; }
+	ATADEBUG(3,"ata_watchdog(r=%08x chunk_left=%x sectors_left=%x)\n",
+		r, r ? r->chunk_left : -1, r ? r->sectors_left : -1);
+
+	if (q && q->cur == NULL) 
+		printf("WARNING: q->cur while command still active\n");
+
+	if (!r) { 
+		ac->tmo_id=0; 
+		return; 
+	}
 
 	BUMP(ac,wd_fired);
 
 	er = ata_err(ac,&ast,&err); 	/*** Check for Error ***/
 
+	if (r->prev_chunk_left != r->chunk_left ||
+	    r->prev_sectors_left != r->sectors_left) {
+		r->wdog_stuck=0;
+		r->prev_chunk_left = r->chunk_left;
+		r->prev_sectors_left = r->sectors_left;
+		progress=1;
+	} else {
+		r->wdog_stuck++;
+	}
+
+	if (r->wdog_stuck > 50) {
+		printf("ata_watchdog: timeout waiting for completion (lba=%ld) ST=%02x ERR=%02x\n", r->lba_cur,ast,err);
+		ata_rescueit(ac);
+		return;
+	}
+
+	s=splbio();
 	if (r->chunk_left > 0 && r->sectors_left > 0) {
 		BUMP(ac,wd_serviced);
 		ata_arm_watchdog(ac,HZ/10);
+		splx(s);
 		return;	
 	}
 	if (r->chunk_left == 0 && r->sectors_left > 0) {
 		BUMP(ac,wd_rekicked);
 		ata_program_next_chunk(ac, r, HZ/8);
+		splx(s);
 		return;
 	}
 	if (r->chunk_left == 0 && r->sectors_left == 0) {
 		BUMP(ac,eoc_polled);
-		ata_finish_current(ac, 0, 12);
+		ata_finish_current(ac, EOK, 12);
+		splx(s);
         	return;
 	}
+	splx(s);
 }
 
 void
 ata_q_put(ata_ctrl_t *ac, ata_req_t *r)
 {
-	ata_ioque_t *que=ac->ioque;
+	ata_ioque_t *q=ac->ioque;
 	int	s;
 
-	ATADEBUG(1,"ata_q_put()\n");
-	s=splbio();
+	ATADEBUG(5,"ata_q_put()\n");
+
+	s = splbio();
         r->next = (ata_req_t *)0;
-        if (que->q_tail)
-                que->q_tail->next = r;
+        if (q->q_tail)
+                q->q_tail->next = r;
         else
-                que->q_head = r;
-        que->q_tail = r;
+                q->q_head = r;
+        q->q_tail = r;
+        ac->nreq++;
 	splx(s);	
 }
 
 ata_req_t *
 ata_q_get(ata_ctrl_t *ac)
 {
-	ata_ioque_t *que=ac->ioque;
-        ata_req_t *r;
-	int	s;
+	ata_ioque_t *q=ac->ioque;
+	ata_req_t *r;
+	int 	s;
 
-	ATADEBUG(1,"ata_q_get()\n");
-	s=splbio();
-        r=que ? que->q_head : NULL;
-        if (r) {
-                que->q_head = r->next;
-                if (!que->q_head) que->q_tail = (ata_req_t *)0;
-                r->next = (ata_req_t *)0;
-        }
+	ATADEBUG(5,"ata_q_get()\n");
+
+	s = splbio();
+	r = q ? q->q_head : NULL;
+	if (r) {
+		q->q_head = r->next;
+		if (!q->q_head) q->q_tail = (ata_req_t *)0;
+		r->next = (ata_req_t *)0;
+		ac->nreq--;
+	}
 	splx(s);
-        return r;
+	return r;
 }
 
 void
 ata_kick(ata_ctrl_t *ac)
 {
-	ata_ioque_t *que=ac->ioque;
-	int 	s = splbio();
+	ata_ioque_t *q = ac->ioque;
+	int 	s, do_start=0;
 
-	ATADEBUG(1,"ata_kick()\n");
-	if (que->busy || que->cur) {
-		splx(s);
-		return;
-	}
-
-	splx(s);
-        if (que->q_head)
-                ata_start(ac);
-}
-
-void
-reset_queue(ata_ioque_t *que,int hard)
-{
-	if (que->tmo_id) {
-    		untimeout(que->tmo_id);
-    		que->tmo_id = 0;
-	}
-	/* Soft reset of the channel engine; do NOT free xfer_buf here. */
-	que->cur       = 0;
-	que->busy      = 0;
-	que->state     = AS_IDLE;
-}
-
-void 
-ata_finish_current(ata_ctrl_t *ac, int err,int place)
-{
-	ata_ioque_t *que = ac->ioque;
-	ata_req_t  *r;
-	buf_t      *bp = NULL;
-	int 	s;
-	size_t bytes_done;
-	u32_t 	resid;
-
-	ata_cancel_watchdog(ac);
+	ATADEBUG(5,"ata_kick(flags=%08x)\n",ac->flags);
 
 	s = splbio();
-	r  = que ? que->cur : NULL;
-	if (!r) {
-		ATADEBUG(9,"ata_finish(reqid: None)\n");
-		if (que) { 
-			que->busy  = 0;
-			que->sync_done = 1; 
-			wakeup((caddr_t)&que->sync_done); 
-		}
-		splx(s);
-		return;
+	if (AC_HAS_FLAG(ac, ACF_INTR_MODE)) {
+		if (!AC_HAS_FLAG(ac,ACF_BUSY) && !q->cur) do_start=1;
+	} else {
+		if (!q->cur) do_start=1;
 	}
-
-	ATADEBUG(9,"ata_finish(reqid: %lu)\n",r->reqid);
-	if (r->flags & ATA_RF_DONE) { splx(s); return; }
-	r->flags |= ATA_RF_DONE;
-
-	bp = r->bp;
-
-	bytes_done = r->xfer_off;
-	if (bp && bytes_done > bp->b_bcount) bytes_done = bp->b_bcount;
-	resid = bp->b_bcount - bytes_done;
-
-	if (!err && !r->is_write && 
-	    (r->flags & ATA_RF_NEEDCOPY) && que->xfer_buf && r->chunk_bytes) {
-		caddr_t dst = (caddr_t)((char *)r->addr + (r->xfer_off - r->chunk_bytes));
-		bcopy(que->xfer_buf, dst, r->chunk_bytes);
-		r->flags &= ~ATA_RF_NEEDCOPY;
-	}
-
-	if (bp) {
-		if (err) berror(bp,que,resid,EIO);
-		else     bok(bp,que,resid);
-	}
-
-	que->busy  = 0;
-	que->cur = NULL;
-
-	if (r) kmem_free(r,sizeof(*r));
-
-	que->sync_done = 1;
-	wakeup((caddr_t)&que->sync_done);
 	splx(s);
-	ata_kick(ac);
-}
 
+        if (do_start) ata_start(ac);
+
+	/* Drive synchronously in POLLMODE */
+	if (!AC_HAS_FLAG(ac, ACF_INTR_MODE) && 
+	     AC_HAS_FLAG(ac, ACF_BUSY)) ata_poll_engine(ac);
+}
 
 void
 ata_start(ata_ctrl_t *ac)
 {
-	ata_ioque_t *que = ac->ioque;
+	ata_ioque_t *q = ac->ioque;
         ata_req_t  *r;
-        int         s;
-	u8_t	drive;
+	u8_t	drive, ast;
+        int	s;
 
-	ATADEBUG(1,"ata_start()\n");
-	if (!ac->intr_mode) return;
+	ast=inb(ATA_ALTSTATUS_O(ac));
+	ATADEBUG(5,"ata_start(#req=%d ST=%02x)\n",ac->nreq,ast);
 
-	s=splbio();
-	if (que->busy || que->cur || que->closing) { splx(s); return; }
+        s = splbio();
+	if (AC_HAS_FLAG(ac,ACF_BUSY) || 
+	    AC_HAS_FLAG(ac,ACF_CLOSING) || q->cur) { splx(s); return; }
 
         /* pop from queue */
 	r=ata_q_get(ac);
@@ -352,42 +177,46 @@ ata_start(ata_ctrl_t *ac)
 		splx(s);
 		return;
 	}
-	ATADEBUG(9,"atastart reqid %lu\n",r->reqid);
 
-        que->cur   = r;
-	que->state = AS_PRIMING;
+        q->cur   = r;
+	q->state = AS_PRIMING;
+	r->await_drq_ticks = HZ * 2;
+	AC_SET_FLAG(ac,ACF_BUSY); 
 
-	ATA_IRQ_ON(ac);
 	r->lba_cur 	= r->lba;
 	r->sectors_left	= r->nsec;
 	r->chunk_left	= 0;
 	r->xfer_off	= 0;
-	drive		= r->drive & 1;
 	
-	ATADEBUG(5,"lba=%lu lba_cur=%lu addr=%lx nsec=%lu secleft=%lu chunkleft=%lu xoff=%lu xlen=%lu nsec=%lu\n",
+	ATADEBUG(5,"Req=%ld lba=%lu nsec=%lu addr=%lx - lba_cur=%lu secleft=%lu chunkleft=%lu xoff=%lu chunk_bytes=%lu\n",
+			r->reqid,
 			r->lba,
-			r->lba_cur,
-			r->addr,
 			r->nsec,
+			r->addr,
+			r->lba_cur,
 			r->sectors_left,
 			r->chunk_left,
 			r->xfer_off,
 			r->chunk_bytes);
+
 	ata_program_next_chunk(ac,r,HZ/8);
-	que->busy  = 1;
-	que->state = AS_PRIMED;
 	splx(s);
 	return;
 }
 
 void
-need_kick(ata_ctrl_t *c)
+need_kick(ata_ctrl_t *ac)
 {
-	ata_ioque_t *que = c->ioque;
+	int	s;
 	
-	if (que->in_isr) {
-		que->pending_kick=1;
+	ATADEBUG(5,"need_kick()\n");
+
+	s=splbio();
+	if (AC_HAS_FLAG(ac, ACF_IN_ISR) || AC_HAS_FLAG(ac,ACF_POLL_RUNNING)) {
+		AC_SET_FLAG(ac,ACF_PENDING_KICK);
+		splx(s);
 		return;
 	}
-	ata_kick(c);
+	splx(s);
+	ata_kick(ac);
 }

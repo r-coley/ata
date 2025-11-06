@@ -1,5 +1,21 @@
 /*
- * ATA header for SVR4 
+ * ATA main header for SVR4 
+ *
+ *  ata_ctrl_t
+ * +-----------
+ * |
+ * | ata_unit_t
+ * |+----------
+ * || Master
+ * |+----------
+ * || Slave
+ * |+----------
+ * |
+ * | ata_ioque_t
+ * |+----------
+ * ||ata_req_t 
+ * |+----------
+ * +-----------
  */
 
 #ifndef _ATA_H
@@ -21,33 +37,162 @@
 #include <sys/inline.h>
 #include <sys/param.h>
 #include <sys/fdisk.h>
+#include <sys/mkdev.h>
 #include <sys/varargs.h>
-
-#define insw(port,addr,count)	linw(port,addr,count)
-#define outsw(port,addr,count)	loutw(port,addr,count)
-
-#define ATA_MAX_XFER_SECTORS 256 /* 128KiB per command */
+#include <sys/xdebug.h>
+#include <sys/kdebugger.h>
 
 /* ---------- Controller limits ---------- */
 #define ATA_MAX_CTRL   	4		
 #define ATA_MAX_DRIVES	2
 #define ATA_MAX_UNITS	(ATA_MAX_CTRL*ATA_MAX_DRIVES)
 
-#define ATA_MAX_RETRIES 3
 #define ATA_NPART 16
+
+/* Simple states for interrupt engine */
+typedef enum {
+	AS_IDLE = 0,
+	AS_PRIMING,
+	AS_PRIMED,
+	AS_XFER,
+	AS_WAIT,
+	AS_DONE,
+	AS_RESET,
+	AS_ERROR
+} ata_state_t;
 
 struct ata_ctrl;
 struct ata_ioque;
 struct ata_unit;
 struct ata_req;
-struct ata_fdisk;
+struct ata_counters;
 typedef struct ata_ctrl ata_ctrl_t;
 typedef struct ata_ioque ata_ioque_t;
 typedef struct ata_unit ata_unit_t;
 typedef struct ata_req ata_req_t;
-typedef struct ata_fdisk ata_fdisk_t;
+typedef struct ata_counters ata_counters_t;
 
-typedef struct 
+typedef struct ata_part {
+	u8_t	active;
+	u32_t	base_lba;
+	u32_t	nsectors;
+	u8_t	systid;
+	int	vtoc_valid;
+	struct partition slice[ATA_NPART];
+} ata_part_t;
+
+/* ---------- I/O port base + helpers ---------- */
+struct ata_ctrl {
+	u16_t	io_base;   	/* base for data..status */
+	u8_t	irq;       	/* wired IRQ (14/15 typical) */
+	u8_t	present;   	/* probed */
+
+	int	idx;
+	int 	nreq;
+	ata_ioque_t *ioque;
+	ata_unit_t *drive[ATA_MAX_DRIVES];
+
+	u32_t	flags;
+	/*** watchdog/timeout ***/
+	int	tmo_id;
+	int	tmo_ticks;
+
+	int	sel_drive;
+	u8_t	sel_hi4;
+	u8_t	sel_mode;
+	
+	u8_t	pio_multi;
+	int	multi_set_ok; /* 1 if SET MULTIPLE accepted */
+
+	/*** Counters ***/
+	ata_counters_t *counters;
+} ;
+
+struct ata_ioque {
+	/*** Submission Queue ***/
+	ata_req_t *q_head;
+	ata_req_t *q_tail;
+	/*** Inflight request ***/
+	ata_req_t *cur;
+	ata_state_t state;
+	/*** IRQ Policy/close gating ***/
+	/*** sync/wakeup for raw/uio and close drain ***/
+	
+	int last_err;
+	/*** staging buffer (lifetime: first open / last close ***/
+	/*caddr_t	xptr;*/
+	caddr_t xfer_buf;
+	u32_t	xfer_bufsz;
+	int	open_count;
+} ;
+
+/* Request representing a hardware chunk derived from a struct buf */
+struct ata_req {
+	struct ata_req *next;
+	struct buf   *bp;        /* original request */
+
+	dev_t	dev;		/* Original dev, udriv could be deduced */
+	int	drive;		/* Drive: 0 master 1 slave */
+	u32_t	reqid;
+
+	int	flags;
+	int 	is_write;  /* 1=write, 0=read */
+	int	await_drq_ticks;
+
+	/*** Chunking/progress ***/
+	caddr_t	addr;     	/* current kernel addr within bp */
+	u32_t	lba;       	/* device LBA(512B for ATA, 2048B for ATAPI) */
+	u32_t	nsec;
+	u32_t	lba_cur;
+	u32_t	sectors_left;	/* How many sectors remain in entire request */
+	u16_t	chunk_left;	/* How many sectors remain in current burst */
+	u32_t 	chunk_bytes;	/* How many bytes remain in current burst */
+	u32_t	xfer_off;
+	u16_t	prev_chunk_left;
+	u16_t	prev_sectors_left;
+	int	wdog_stuck;
+	caddr_t	xptr;
+
+	u8_t	cmd;
+	u16_t	atapi_bytes;
+
+	u8_t	ast;
+	u8_t	err;
+} ;
+
+struct ata_unit {
+	int 	present;             	/* device probed */
+	int 	is_atapi;            	/* 1 if packet device */
+	int	is_cdrom:1;
+	int	media_present:1;
+	int 	lba_ok;              	/* 1 if LBA28 supported */
+	u32_t 	nsectors;  		/* total 512B sectors (ATA only) */
+	int	pio_multi;
+
+	ata_part_t fd[4];
+	int	fdisk_valid;
+
+	char 	model[41];
+	int  	ioctl_warned;
+	int  	read_only;          	/* 1 if media/device RW locked */
+	uchar_t atapi_pdt;
+	uchar_t atapi_rmb;
+	char	vendor[9];
+	char 	product[17];
+	u16_t	devtype;
+
+	u32_t	atapi_blocks;
+	u32_t	atapi_blksz;
+	u16_t	lbsize;
+	u8_t	lbshift;
+
+	u8_t	cdb[12];
+	caddr_t	atapi_bounce;
+
+	int	drive;
+};
+
+struct ata_counters
 {
 	u32_t	polled_reads;
 	u32_t	polled_write;
@@ -81,135 +226,39 @@ typedef struct
 	u32_t	wd_chunk;
 	u32_t	eoc_polled;
 	u32_t	softresets;
-} ata_counters_t;
-
-/* Simple states for interrupt engine */
-typedef enum {
-	AS_IDLE = 0,
-	AS_PRIMING,
-	AS_PRIMED,
-	AS_XFER,
-	AS_WAIT,
-	AS_DONE,
-	AS_RESET,
-	AS_ERROR
-} ata_state_t;
-
-struct ata_fdisk {
-	u32_t	base_lba;
-	u32_t	nsectors;
-	u8_t	systid;
-	int	vtoc_valid;
-	struct partition slice[ATA_NPART];
 } ;
 
-/* ---------- I/O port base + helpers ---------- */
-struct ata_ctrl {
-	u16_t	io_base;   	/* base for data..status */
-	u8_t	irq;       	/* wired IRQ (14/15 typical) */
-	u8_t	present;   	/* probed */
+#ifndef TRUE
+#define TRUE 	1
+#define FALSE 	0
+#endif
 
-	int	idx;
-	ata_ioque_t *ioque;
-	ata_unit_t *drive[ATA_MAX_DRIVES];
+#define EOK	0
 
-	int	sel_drive;
-	u8_t	sel_hi4;
-	u8_t	sel_mode;
-	
-	u8_t	intr_mode;
-	u8_t	irq_enabled;
+#define IKDB()	si86_call_demon()
 
-	/*** Counters ***/
-	ata_counters_t counters;
-} ;
+/* Choose PIO Multiple policy: 1=max drive-supported, 0=cap at 8 */
+#define ATA_USE_MAX_MULTIPLE 1
+#define ATA_MAX_XFER_SECTORS 256 /* 128KiB per command */
 
-struct ata_ioque {
-	/*** Submission Queue ***/
-	ata_req_t *q_head;
-	ata_req_t *q_tail;
-	/*** Inflight request ***/
-	ata_req_t *cur;
-	int     busy;
-	ata_state_t state;
-	/*** IRQ Policy/close gating ***/
-	int     closing;
-	/*** sync/wakeup for raw/uio and close drain ***/
-	int     sync_done;
-	/*** watchdog/timeout ***/
-	int	tmo_id;
-	int	tmo_ticks;
-	/*** staging buffer (lifetime: first open / last close ***/
-	caddr_t xfer_buf;
-	u32_t	xfer_bufsz;
-	caddr_t	xptr;
-	/*** open/close ownership ***/
-	int	open_count;
-	/*** Stuff ***/
-	int	in_isr;
-	int	pending_kick;
+#define ATA_MAX_RETRIES 3
 
-} ;
+/* --- Unified controller flags --- */
+#define ACF_INTR_MODE     0x0001  /* interrupts enabled path */
+#define ACF_IN_ISR        0x0002  /* currently in ISR context */
+#define ACF_POLL_RUNNING  0x0004  /* poll engine active */
+#define ACF_PENDING_KICK  0x0008  /* deferred kick requested */
+#define ACF_BUSY  	  0x0010  /* busy */
+#define ACF_CLOSING  	  0x0020  /* busy */
+#define ACF_IRQ_ON	  0x0040  /* Interupts Enabled */
+#define ACF_SYNC_DONE     0x0080  /* current sync request done */
 
-/* Request representing a hardware chunk derived from a struct buf */
-struct ata_req {
-	struct ata_req *next;
-	struct buf   *bp;        /* original request */
+#define AC_HAS_FLAG(ac,f)   (((ac)->flags & (f)) != 0)
+#define AC_SET_FLAG(ac,f)   ((ac)->flags |= (f))
+#define AC_CLR_FLAG(ac,f)   ((ac)->flags &= ~(f))
 
-	dev_t	dev;		/* Original dev, udriv could be deduced */
-	int	drive;		/* Drive: 0 master 1 slave */
-	u32_t	reqid;
-
-	int	flags;
-	int 	is_write;  /* 1=write, 0=read */
-	u32_t	lba;       /* device LBA(512B for ATA, 2048B for ATAPI) */
-	u32_t	nsec;
-	caddr_t	addr;     /* current kernel addr within bp */
-	int	done;
-	u8_t	dh_cmd;
-
-	/*** Chunking/progress ***/
-	u32_t	lba_cur;
-	u32_t	sectors_left;
-	u16_t	chunk_left;
-	u32_t	xfer_off;
-	u32_t 	chunk_bytes;
-
-	u8_t	cmd;
-	u16_t	atapi_bytes;
-	int	use_bounce;
-} ;
-
-struct ata_unit {
-	int 	present;             	/* device probed */
-	int 	is_atapi;            	/* 1 if packet device */
-	int	is_cdrom:1;
-	int	media_present:1;
-	int 	lba_ok;              	/* 1 if LBA28 supported */
-	u32_t 	nsectors;  		/* total 512B sectors (ATA only) */
-
-	ata_fdisk_t fd[4];
-	int	fdisk_valid;
-
-	char 	model[41];
-	int  	ioctl_warned;
-	int  	read_only;          	/* 1 if media/device RW locked */
-	uchar_t atapi_pdt;
-	uchar_t atapi_rmb;
-	char	vendor[9];
-	char 	product[17];
-	u16_t	devtype;
-
-	u32_t	atapi_blocks;
-	u32_t	atapi_blksz;
-	u16_t	lbsize;
-	u8_t	lbshift;
-
-	u8_t	cdb[12];
-	caddr_t	atapi_bounce;
-
-	int	drive;
-};
+#define insw(port,addr,count)	linw(port,addr,count)
+#define outsw(port,addr,count)	loutw(port,addr,count)
 
 #define ATA_RF_NEEDCOPY	0x0001
 #define ATA_RF_DONE	0x80000000u
@@ -217,7 +266,7 @@ struct ata_unit {
 #define SEL_CHS		0
 #define SEL_LBA28	1
 
-#define ATA_SECTSIZE	512
+#define ATA_SECSIZE	512
 
 /* Register offsets from io_base */
 #define ATA_DATA         0x00
@@ -255,16 +304,16 @@ struct ata_unit {
 #define ATA_ALTSTATUS_O(c)   (c->io_base+0x206 + ATA_ALTSTATUS)
 #define ATA_DEVCTRL_O(c)     (c->io_base+0x206 + ATA_DEVCTRL)
 
-
-#define U2CTRLNO(X)	((X)->ctrl-&ata_ctrl[0])
+#define U2CTRLNO(X)		((X)->ctrl-&ata_ctrl[0])
 
 /* Status bits */
-#define ATA_ST_BSY   		0x80	/* Drive is busy */
-#define ATA_ST_DRDY  		0x40	/* Drive is ready for command */
-#define ATA_ST_DF    		0x20	/* Drive Fault */
-#define ATA_ST_DSC   		0x10	/* Drive seek complete */
-#define ATA_ST_DRQ   		0x08	/* Data request RD/WR xfer sector */
-#define ATA_ST_ERR   		0x01	/* Error */
+#define ATA_SR_ERR   		0x01	/* Error */
+#define ATA_SR_DRQ   		0x08	/* Data request RD/WR xfer sector */
+#define ATA_SR_DSC   		0x10	/* Drive seek complete */
+#define ATA_SR_DWF    		0x20	/* Drive Fault */
+#define ATA_SR_DRDY  		0x40	/* Drive is ready for command */
+#define ATA_SR_BSY   		0x80	/* Drive is busy */
+#define ATA_ERR(ast)		((ast&(ATA_SR_ERR|ATA_SR_DWF)) != 0)
 
 /* Devctl */
 #define ATA_CTL_SRST 		0x04	/* Software Reset */
@@ -272,39 +321,48 @@ struct ata_unit {
 #define ATA_CTL_IRQEN 		0x00	/* Enable INTRQ */
 
 /* Simple hd.c-style IRQ helpers */
-#define ATA_IRQ_ON(c)   do { \
-		if (!c->irq_enabled) { \
-			outb(ATA_DEVCTRL_O(c), ATA_CTL_IRQEN); \
-			c->irq_enabled=1; \
+#define ATA_IRQ_ON(ac)   do { \
+		if (!AC_HAS_FLAG(ac,ACF_IRQ_ON)) { \
+			outb(ATA_DEVCTRL_O(ac), ATA_CTL_IRQEN); \
+			AC_SET_FLAG(ac,ACF_IRQ_ON); \
 		} \
-		BUMP(c,irq_turnon); \
+		BUMP(ac,irq_turnon); \
 	} while (0)
-#define ATA_IRQ_OFF(c,force)  do { \
-		if (c->irq_enabled || force) { \
-			outb(ATA_DEVCTRL_O(c), ATA_CTL_NIEN); \
-			c->irq_enabled=0; \
+
+#define ATA_IRQ_OFF(ac,force)  do { \
+		if (AC_HAS_FLAG(ac,ACF_IRQ_ON) || force) { \
+			outb(ATA_DEVCTRL_O(ac), ATA_CTL_NIEN); \
+			AC_CLR_FLAG(ac,ACF_IRQ_ON); \
 		} \
-		BUMP(c,irq_turnoff); \
+		BUMP(ac,irq_turnoff); \
 	} while (0)
 
 /* DRVHD bits */
 #define ATA_DHFIXED 		0xA0  /* 1,0,1,x, head3..0 */
-#define ATA_DHDRV   		0x10
 #define ATA_DHLBA     		0x40
 
-#define ATA_DH(d,lba,h4)  (ATA_DHFIXED|(((d)&1)<<4)|((lba)?0x40:0)|((h4)&0x0F))
-
+#define ATA_DH(d,lba,h4) \
+		( (ATA_DHFIXED) | \
+		  ((lba) ? ATA_DHLBA : 0) | \
+		  (((d) & 1) << 4) | \
+		  ((h4) & 0x0F) )
+ 
 /* ATA/ATAPI commands */
 #define ATA_CMD_IDENTIFY        0xEC
 #define ATA_CMD_READ_SEC        0x20
-#define ATA_CMD_WRITE_SEC       0x30
 #define ATA_CMD_READ_SEC_EXT    0x24
+#define ATA_CMD_READ_MULTI	0xC4
+#define ATA_CMD_READ_MULTI_EXT	0x29
+#define ATA_CMD_WRITE_SEC       0x30
 #define ATA_CMD_WRITE_SEC_EXT   0x34
+#define ATA_CMD_WRITE_MULTI	0xC5
+#define ATA_CMD_WRITE_MULTI_EXT	0x39
 #define ATA_CMD_READ_SEC_RETRY  0x21
 #define ATA_CMD_FLUSH_CACHE     0xE7
 #define ATA_CMD_FLUSH_CACHE_EXT 0xEA
 #define ATA_CMD_PACKET          0xA0
 #define ATA_CMD_IDENTIFY_PKT    0xA1
+#define ATA_CMD_SET_MULTI	0xC6
 
 /* ATAPI CDB opcodes */
 #define CDB_TEST_UNIT_READY     0x00
@@ -317,28 +375,42 @@ struct ata_unit {
 #define CDB_READ_10             0x28
 #define CDB_READ_CAPACITY       0x25
 
-/* ---------- Minor layout (USL-style, extended) ----------
- * bits 7..5 = controller (0..3)
- * bit    4  = drive      (0..1)
- * bits 3..0 = partition  (0..15) (we use 0..15 typically)
+/* Minor layout (USL-style, extended) ----------
+ * 15 14 12 12  11 10 09 08  07 06 05 04  03 02 01 00
+ *                    +-+-+  +  +-+-+ +   +----+----+
+ *                      |    |    |   |        |
+ *                      |    |    |   |        +------- Slice
+ *                      |    |    |   +---------------- Drive 
+ *                      |    |    +-------------------- Controller
+ *                      |    +------------------------- ABSDEV (Whole Disk)
+ *                      +------------------------------ Partition
+ * Only Root can open ABSDEV() to give rw to entire disk irrepective
+ * of slices but confined still to the partion map
  */
-#define ATA_WHOLE_FDISK_SLICE   0x0F
+/*#define BASEDEV(dev)	(dev_t)((dev) & ~0x0F)*/
+/* #define BASEDEV(dev)	(dev_t)((dev) & ~0x30F)*/
+#define BASEDEV(dev)	(dev_t)(((dev) & ~0x30F)|0xf)
+#define ABSDEV(dev)	(BASEDEV(dev)|0x80)
+#define ISABSDEV(dev)	((dev)&0x80)
+
+#define ATA_WHOLE_PART_SLICE   0x0F
 #define ATA_CTRL(m)       (((getminor(m)) >> 5) & 0x03)
 #define ATA_DRIVE(m)      (((getminor(m)) >> 4) & 0x01)
-#define ATA_SLICE(m)	  ((getminor(m)) & ATA_WHOLE_FDISK_SLICE)
-#define ATA_FDISK(m)      (((getminor(m)) >> 8) & 0x03)
+#define ATA_SLICE(m)	  ((getminor(m)) & ATA_WHOLE_PART_SLICE)
+#define ATA_PART(m)       (((getminor(m)) >> 8) & 0x03)
 
 /* Unit helpers: unit = ctrl*2 + drive */
 #define ATA_UNIT_FROM(c,d)   	(((c) << 1) | ((d) & 1))
 #define ATA_CTRL_FROM_UNIT(u) 	((u) >> 1)
 #define ATA_DRIVE_FROM_UNIT(u) 	((u) & 1)
 #define ATA_UNIT(m)          	ATA_UNIT_FROM(ATA_CTRL(m), ATA_DRIVE(m))
+#define ATA_DEV(c,d)		(ATA_UNIT_FROM(c,d)<<4)
 
 /* ---------- Per-unit state ---------- */
 
-#define BUMP(C,field)	(C)->counters.field++
+#define BUMP(C,field)	(C)->counters->field++
 
-/* Well known FDISK partition types */
+/* Well known fdisk partition types */
 #define EMPTY		0x00
 #define FAT12		0x01	
 #define FAT16		0x04	
@@ -355,10 +427,25 @@ struct ata_unit {
 #define NETBSD		0xA9
 #define SOLARIS		0xBF
 
+#define DEV_UNKNOWN	0x0000
+#define DEV_ATA		0x0010
+#define DEV_ATAPI	0x0020
+#define DEV_PARALLEL	0x0000
+#define DEV_SERIAL	0x0001
 
 #define ATA_PDLOC	29	/* Sector location of PDINFO */
 
 #define ATA_XFER_BUFSZ	(64*1024)	/* 64k */
+
+#define XFERINC(R) \
+	do { \
+	(R)->xptr     += ATA_SECSIZE; \
+	(R)->xfer_off += ATA_SECSIZE; \
+	if ((R)->chunk_left >= 0) (R)->chunk_left   -= 1; \
+	else			  (R)->chunk_left    = 0; \
+	if ((R)->sectors_left >= 0) (R)->sectors_left -= 1; \
+	else			    (R)->sectors_left  = 0; \
+	} while (0)
 
 #define DDI_INTR_UNCLAIMED	0
 #define DDI_INTR_CLAIMED	1
@@ -368,12 +455,11 @@ extern 	ata_ctrl_t ata_ctrl[ATA_MAX_CTRL];
 extern	int 	atadebug;
 extern	int 	ata_force_polling;
 extern 	ata_unit_t ata_unit[];
+extern	u32_t req_seq;
 
-void 	pio_one_sector(ata_ctrl_t *, u8_t, int);
+int 	pio_one_sector(ata_ctrl_t *, ata_req_t *);
 void 	ata_service_irq(ata_ctrl_t *, u8_t, u8_t);
 void 	ata_region_from_dev(dev_t, u32_t *, u32_t *);
-char 	*CCstr(ata_ctrl_t *);
-char 	*Cstr(dev_t);
 void 	ataprint(dev_t, char *);
 int 	ataopen(dev_t *, int, int, cred_t *);
 int 	ataclose(dev_t, int, int, cred_t *);
@@ -384,9 +470,7 @@ int 	ataioctl(dev_t, int, caddr_t, int, cred_t *, int *);
 int 	atasize(dev_t dev);
 int 	atainit(void);
 int 	ataintr(int);
-char 	*Ustr(ata_unit_t *);
 void 	ata_region_from_dev(dev_t, u32_t *, u32_t *);
-char 	*Cstr(dev_t);
 void 	ataprint(dev_t, char *);
 int 	ataopen(dev_t *, int, int, cred_t *);
 int 	ataclose(dev_t, int, int, cred_t *);
@@ -397,24 +481,24 @@ int 	ataioctl(dev_t, int, caddr_t, int, cred_t *, int *);
 int 	atasize(dev_t dev);
 int 	atainit(void);
 int 	ataintr(int);
-char 	*Ustr(ata_unit_t *);
+char 	*Cstr(ata_ctrl_t *);
+char 	*Dstr(dev_t);
 
 int 	do_ata_strategy(struct buf *);
 int 	ata_send_packet(ata_ctrl_t *, u8_t, const u8_t *, int);
 void 	ata_udelay(int);
-int 	ata_wait(ata_ctrl_t *, u32_t, u32_t, long);
-int 	ata_wait_ready(ata_ctrl_t *);
+int 	ata_wait(ata_ctrl_t *, u8_t, u8_t, long, u8_t *, u8_t *);
 int 	ata_sel(ata_ctrl_t *,int, u32_t);
 int 	ata_sel_chs(ata_ctrl_t *,int);
 int 	ata_sel_lba28(ata_ctrl_t *, u8_t, u8_t);
 char 	*get_sysid(u8_t);
 void 	ata_dump_fdisk(ata_ctrl_t *,u8_t);
 int 	ata_identify(ata_ctrl_t *, int);
-int 	ata_pio_write(ata_ctrl_t *,u8_t, u32_t, int, caddr_t);
-int 	ata_pio_read(ata_ctrl_t *,u8_t, u32_t, int, caddr_t);
+int 	ata_pio_write(ata_ctrl_t *,ata_req_t *);
+int 	ata_pio_read(ata_ctrl_t *,ata_req_t *);
 int 	ata_flush_cache(ata_ctrl_t *,u8_t);
-int 	ata_read_fdisk(ata_ctrl_t *,u8_t);
-int 	ata_read_vtoc(ata_ctrl_t *, u8_t, int);
+int 	ata_pdinfo(dev_t);
+int 	ata_read_vtoc(dev_t, int);
 void 	ata_copy_model(u16_t *, char *);
 int 	ata_read_signature(ata_ctrl_t *, u8_t, u16_t *);
 int 	ata_is_atapi_by_sig(u8_t, u8_t);
@@ -432,34 +516,40 @@ int 	do_atapi_strategy(struct buf *);
 void 	ata_dump_regs(ata_ctrl_t *, char *);
 void 	ata_quiesce_ctrl(ata_ctrl_t *);
 void	ata_dump_stats(void);
-int 	berror(struct buf *, ata_ioque_t *, int, int);
-int 	bok(struct buf *, ata_ioque_t *, int);
+int 	berror(struct buf *, int, int);
+int 	bok(struct buf *, int);
 void 	ata_softreset_ctrl(ata_ctrl_t *);
 void 	ata_softreset_ctrl2(ata_ctrl_t *);
 
 void 	ata_softreset_ctrl(ata_ctrl_t *);
 ata_req_t *alloc_request(dev_t, u32_t, u32_t, int, caddr_t);
 ata_req_t *ata_q_get(ata_ctrl_t *);
-void 	ata_program_next_chunk(ata_ctrl_t *,ata_req_t *,int);
+int 	ata_program_next_chunk(ata_ctrl_t *,ata_req_t *,int);
 void 	ata_arm_watchdog(ata_ctrl_t *, int);
 void 	ata_cancel_watchdog(ata_ctrl_t *);
 void 	ata_watchdog(caddr_t);
 void 	ata_q_put(ata_ctrl_t *, ata_req_t *);
 void 	ata_kick(ata_ctrl_t *);
-void 	reset_queue(ata_ioque_t *,int);
+void 	reset_queue(ata_ctrl_t *,int);
 void 	ata_finish_current(ata_ctrl_t *, int,int);
 void 	ata_start(ata_ctrl_t *);
 void 	free_request(ata_req_t *);
 void 	ata_delay400(ata_ctrl_t *);
-void 	ATADEBUG(int, char *, ... );
 int 	ata_err(ata_ctrl_t *, u8_t *, u8_t *);
 void 	ata_program_taskfile(ata_ctrl_t *, ata_req_t *);
 int	atapi_test_unit_ready(ata_ctrl_t *, u8_t, int *);
-
-#define DEV_UNKNOWN	0x0000
-#define DEV_ATA		0x0010
-#define DEV_ATAPI	0x0020
-#define DEV_PARALLEL	0x0000
-#define DEV_SERIAL	0x0001
+void 	ata_poll_engine(ata_ctrl_t *);
+int 	ata_abs_rw(ata_ctrl_t *, int, int, u32_t, caddr_t, u32_t);
+int 	ata_data_phase_service(ata_ctrl_t *,ata_req_t *);
+int	multicmd(ata_ctrl_t *,int,u32_t,u32_t);
+int	ata_pushreq(ata_ctrl_t *,ata_req_t *);
+char 	*getstr(char *, int, int, int);
+void	ATADEBUG(int,char *,...);
+void 	ata_prime_write(ata_ctrl_t *, ata_req_t *);
+int 	ata_getblock(dev_t, daddr_t, caddr_t, u32_t);
+int 	ata_putblock(dev_t, daddr_t, caddr_t, u32_t);
+void 	dumpbuf(char *, u32_t, char *);
+int 	ata_fdisk();
+void 	ata_negotiate_pio_multiple(ata_ctrl_t *, u8_t);
 
 #endif /* _ATA_H */

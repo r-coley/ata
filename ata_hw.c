@@ -3,19 +3,57 @@
  */
 
 #include "ata.h"
+#include <sys/varargs.h>
+#define ATA_LOG_SIZE 1024
+
+u32_t	req_seq=0;
+extern	int ata_major;
+
+int
+berror(struct buf *bp, int resid, int err)
+{
+	char *str = ISABSDEV(bp->b_edev) ? "<ABSDEV>" : "";
+
+	ATADEBUG(1,"berror(%s)\n",str);
+	bp->b_flags |= B_ERROR; 
+	bp->b_error = err; 
+	bp->b_resid = resid;
+	biodone(bp); 
+	return 0;
+}
+
+int
+bok(struct buf *bp, int resid)
+{
+	char *str = ISABSDEV(bp->b_edev) ? "<ABSDEV>" : "";
+	ATADEBUG(1,"bok(%s)\n",str);
+	bp->b_flags &= ~B_ERROR; 
+	bp->b_resid = resid;
+	if (ISABSDEV(bp->b_edev) && !(bp->b_flags & B_READ)) {
+		ata_ctrl_t *ac = &ata_ctrl[ATA_CTRL(bp->b_edev)];
+		u8_t drive = ATA_DRIVE(bp->b_edev);
+		bflush(bp->b_edev);
+		ata_flush_cache(ac,drive);
+	}
+	biodone(bp);
+	return 0;
+}
 
 int
 ata_sel(ata_ctrl_t *ac, int drive, u32_t lba)
 {
 	ata_unit_t *u=ac->drive[drive];
-	if (!u) return EIO;
+	u8_t ast, erc; 
 
-	ATADEBUG(9,"ata_sel(%d,%lu): ",drive,lba);
+	if (!u) return EIO;
+	ata_err(ac, &ast, &erc);
+
+	ATADEBUG(9,"ata_sel(%d,%lu) ST=%02x ER=%02x: ",drive,lba,ast,erc);
 	if (u->lba_ok) {
 		u8_t	hi4 = (u8_t)((lba>>24) & 0x0f);
 		if (1 || ac->sel_drive != drive || ac->sel_mode != SEL_LBA28 || 
 						   ac->sel_hi4 != hi4) {
-			ATADEBUG(9,"LBA\n");
+			ATADEBUG(1,"LBA %02x\n",ATA_DH(drive,1,hi4));
 			outb(ATA_DRVHD_O(ac), ATA_DH(drive,1,hi4));
 			ata_delay400(ac);
 			ac->sel_drive = drive;
@@ -25,7 +63,7 @@ ata_sel(ata_ctrl_t *ac, int drive, u32_t lba)
 	} else {
 		if (1 || ac->sel_drive != drive || ac->sel_mode != SEL_CHS || 
 						   ac->sel_hi4 != 0) {
-			ATADEBUG(9,"CHS\n");
+			ATADEBUG(1,"CHS %02x\n",ATA_DH(drive,0,0));
 			outb(ATA_DRVHD_O(ac), ATA_DH(drive,0,0));
 			ata_delay400(ac);
 			ac->sel_drive = drive;
@@ -39,27 +77,27 @@ ata_sel(ata_ctrl_t *ac, int drive, u32_t lba)
 static void
 atapi_program_packet(ata_ctrl_t *ac,u8_t drive,u16_t byte_count)
 {
-	ata_req_t r;
+	ata_req_t rb, *r=&rb;
 
-	ATADEBUG(1,"atapi_program_packet(%s)\n",CCstr(ac));
-	bzero((caddr_t)&r,sizeof(r));
-	r.drive		= drive;
-	r.cmd		= ATA_CMD_PACKET;
-	r.atapi_bytes	= (byte_count ? byte_count : 2048);
-	r.lba_cur	= 0;
-	r.sectors_left	= 0;
-	r.chunk_left	= 0;
-	r.is_write	= 0;
-	ata_program_taskfile(ac,&r);
+	ATADEBUG(1,"atapi_program_packet(%s)\n",Cstr(ac));
+	bzero((caddr_t)r,sizeof(r));
+	r->drive	= drive;
+	r->cmd		= ATA_CMD_PACKET;
+	r->atapi_bytes	= (byte_count ? byte_count : 2048);
+	r->lba_cur	= 0;
+	r->sectors_left	= 0;
+	r->chunk_left	= 0;
+	r->is_write	= 0;
+	ata_program_taskfile(ac,r);
 }
 
 static void
-atapi_issue_packet(ata_ctrl_t *ac, ata_unit_t *u, u16_t byte_count)
+atapi_issue_packet(ata_ctrl_t *ac, int drive, u16_t byte_count)
 {
-	ATADEBUG(1,"atapi_issue_packet(%s)\n",CCstr(ac));
+	ATADEBUG(1,"atapi_issue_packet(%s)\n",Cstr(ac));
 
 	/* Select device + 400ns settle */
-	ata_sel(ac,u->drive,0);
+	ata_sel(ac,drive,0);
 
 	/* FEAT=0, SECCNT=0, Byte Count in CYCLOW/HIGH */
 	outb(ATA_FEAT_O(ac),    0x00);
@@ -70,84 +108,13 @@ atapi_issue_packet(ata_ctrl_t *ac, ata_unit_t *u, u16_t byte_count)
 	outb(ATA_CMD_O(ac), ATA_CMD_PACKET);
 }
 
-/*********** ATA Routines *************/
 void
 ata_delay400(ata_ctrl_t *c)
 {
-	(void)inb(ATA_ALTSTATUS_O(c));
-	(void)inb(ATA_ALTSTATUS_O(c));
-	(void)inb(ATA_ALTSTATUS_O(c));
-	(void)inb(ATA_ALTSTATUS_O(c));
-}
-
-int
-berror(struct buf *bp, ata_ioque_t *que, int resid, int err)
-{
-	ATADEBUG(1,"berror()\n");
-	bp->b_flags |= B_ERROR; 
-	bp->b_error = err; 
-	bp->b_resid = resid;
-	if (que) que->cur=0;
-	biodone(bp); 
-	return 0;
-}
-
-int
-bok(struct buf *bp, ata_ioque_t *que, int resid)
-{
-	ATADEBUG(1,"bok()\n");
-	bp->b_flags &= ~B_ERROR; 
-	bp->b_resid = resid;
-	if (que) que->cur=0;
-	biodone(bp);
-	return 0;
-}
-
-int
-do_ata_strategy(struct buf *bp)
-{
-	dev_t	dev=bp->b_edev;
-	ata_ctrl_t *ac = &ata_ctrl[ATA_CTRL(dev)];
-	ata_ioque_t *que = ac->ioque;
-	ata_unit_t *u = ac->drive[ATA_DRIVE(dev)];
-	ata_req_t *r;
-	u32_t   base, len, lba, left;
-	u8_t	drive = u->drive;
-	char    *addr;
-	int     s, is_write;
-
-	ATADEBUG(1,"do_ata_strategy()\n");
-	/* Unit present? */
-	if (!u->present) return berror(bp,que,0,ENODEV);
-
-	/* Map region (512-byte sectors) */
-	ata_region_from_dev(dev, &base, &len);
-	if (len == 0) return berror(bp,que,0,ENXIO);
-
-	/* Request geometry from bp */
-	lba      = base + (u32_t)bp->b_blkno;        /* 512B sectors */
-	left     = (u32_t)(bp->b_bcount >> 9);       /* 512B sectors */
-	addr     = (char *)bp->b_un.b_addr;
-	is_write = ((bp->b_flags & B_READ) == 0);
-
-	ATADEBUG(5,"do_ata_strategy(%s): build req lba=%lu nsec=%lu bytes=%u is_write=%d buf=%lx\n",
-		Cstr(dev),lba,left,bp->b_bcount,is_write,addr);
-
-	/* Polled PIO fallback: split into <=256-sector commands */
-	while (left > 0) {
-		u32_t 	chunk = (left > 256U) ? 256U : left;
-
-		int   rc    = is_write
-			? ata_pio_write(ac, drive, lba, chunk, addr)
-			: ata_pio_read (ac, drive, lba, chunk, addr);
-
-		if (rc) return berror(bp,que,0,EIO);
-
-		lba  += chunk;
-		left -= chunk;
-		addr += (chunk << 9);                /* bytes */
-	}
-	return bok(bp,que,0);
+	(void)inb(ATA_ALTSTATUS_O(c));	/*Force delay*/
+	(void)inb(ATA_ALTSTATUS_O(c));	/*Force delay*/
+	(void)inb(ATA_ALTSTATUS_O(c));	/*Force delay*/
+	(void)inb(ATA_ALTSTATUS_O(c));	/*Force delay*/
 }
 
 /* Send an ATAPI PACKET and the 12-byte CDB.
@@ -160,9 +127,9 @@ ata_send_packet(ata_ctrl_t *ac, u8_t drive, const u8_t *cdb, int cdb_len)
 	u16_t 	words_cdb[6];
 	int 	i, spins;
 
-	ATADEBUG(1,"ata_send_packet(%s)\n",CCstr(ac));
+	ATADEBUG(1,"ata_send_packet(%s)\n",Cstr(ac));
 
-	/* Select device + 400ns (4 ALTSTATUS reads) */
+	/* Select device */
 	ata_sel(ac,drive,0);
 
 	/* Clear side registers some chips expect 0 */
@@ -178,77 +145,82 @@ ata_send_packet(ata_ctrl_t *ac, u8_t drive, const u8_t *cdb, int cdb_len)
 	outb(ATA_CMD_O(ac), 0xA0);
 
 	/* Wait for BSY=0 & DRQ=1 (device ready to accept CDB) */
-	spins = 200000; /* ~200ms with 1us polls */
-	while (spins--) {
-		st = inb(ATA_ALTSTATUS_O(ac));
-		if (st & ATA_ST_ERR) {
-			(void)inb(ATA_ALTSTATUS_O(ac));
-			errreg = inb(ATA_FEAT_O(ac));
-			return EIO;
-		}
-		if (!(st & ATA_ST_BSY) && (st & ATA_ST_DRQ)) break;
-		drv_usecwait(1); /* ata_udelay(1); */
-	}
-	if (spins <= 0) {
-		(void)inb(ATA_ALTSTATUS_O(ac));
+	if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_BSY, 200000, 0, 0) != 0) {
 		return ETIMEDOUT;
 	}
+	/* Check for ERR/DWF via altstatus */
+	{ u8_t ast, erc; if (ata_err(ac, &ast, &erc)) return EIO; }
 
 	/* Write exactly 12 bytes of CDB (pad to 6 words) */
 	for (i = 0; i < 6; ++i) words_cdb[i] = 0;
 	for (i = 0; i < cdb_len && i < 12; ++i)
 		((u8_t *)words_cdb)[i] = cdb[i];
-	for (i = 0; i < 6; ++i)
-		outw(ATA_DATA_O(ac), words_cdb[i]);
 
+	outsw(ATA_DATA_O(ac),(u16_t *)words_cdb,6);
 	return 0;
 }
 
 int
-ata_wait(ata_ctrl_t *ac, u32_t must_set, u32_t must_clear, long usec)
+ata_wait(ata_ctrl_t *ac, u8_t must_set, u8_t must_clear, long usec, u8_t *st, u8_t *err)
 {
-	u8_t st;
+	u8_t s;
 	long i;
 
-	for (i = 0; i < usec; ++i) {
-		st = inb(ATA_ALTSTATUS_O(ac));
-		if (((st & must_set) == must_set) && ((st & must_clear) == 0))
+	for (i = 0; i <= usec; ++i) {
+		s = inb(ATA_ALTSTATUS_O(ac));
+		if (((s & must_set) == must_set) && ((s & must_clear) == 0)) {
+			if (st) *st = s;
+			if (err) *err = inb(ATA_ERROR_O(ac));
 			return 0;
-		drv_usecwait(1); /* ata_udelay(1);*/
+		}
+		drv_usecwait(1);
 	}
+	if (st) *st = s;
+	if (err) *err = inb(ATA_ERROR_O(ac));
 	return EIO;
 }
 
 int
-ata_wait_ready(ata_ctrl_t *ac)
+ata_fdisk(int mode)
 {
-	u32_t	guard = 100000;
+	ata_ctrl_t *ac = &ata_ctrl[1];
+	struct ipart *ipart;
+	struct mboot *mboot;
+	int	i;
+	dev_t	dev=ATA_DEV(1,0);
 
-	return ata_wait(ac,ATA_ST_DRDY,ATA_ST_BSY|ATA_ST_DRQ,guard);
-}
-
-char *
-get_sysid(u8_t systid)
-{
-	switch(systid) {
-	case EMPTY:		return "Empty";
-	case UNUSED:		return "Unused";
-	case FAT12:		return "FAT12";
-	case PCIXOS:		return "PCIXOS";
-	case FAT16:		return "FAT16";
-	case EXTDOS:		return "EXTDOS";
-	case NTFS:		return "NTFS";
-	case DOSDATA:		return "DOSDATA";
-	case OTHEROS:		return "OTHEROS";
-	case SVR4:		return "Unix SVR4";
-	case LINUXSWAP:		return "Linux Swap";
-	case LINUXNATIVE:	return "Linux";
-	case BSD386:		return "BSD386";
-	case OPENBSD:		return "OpenBSD";
-	case NETBSD:		return "NetBSD";
-	case SOLARIS:		return "Solaris";
+	if (mode == 0) {
+		ata_dump_fdisk(ac,1);
+		return;
 	}
-	return "??";
+
+	mboot = (struct mboot *)kmem_alloc(DEV_BSIZE,KM_SLEEP);
+	if (!mboot) return ENOMEM;
+
+        if (ata_getblock(ABSDEV(dev),0,(caddr_t)mboot,DEV_BSIZE) != 0) {
+		kmem_free((caddr_t)mboot,DEV_BSIZE);
+		return EIO;
+	}
+
+	for(i=0; i<4; i++,ipart++) {
+		ipart = (struct ipart *)&mboot->parts[i];
+		ipart->bootid  = 0;
+		ipart->systid  = 0;
+		ipart->relsect = 0L;
+		ipart->numsect = 0L;
+
+		ipart->beghead = 0;
+		ipart->begsect = 0;
+		ipart->begcyl  = 0;
+		ipart->endhead = 0;
+		ipart->endsect = 0;
+		ipart->endcyl  = 0;
+	}
+        if (ata_putblock(ABSDEV(dev),0,(caddr_t)mboot,DEV_BSIZE) != 0) {
+		kmem_free((caddr_t)mboot,DEV_BSIZE);
+		return EIO;
+	}
+	kmem_free((caddr_t)mboot,DEV_BSIZE);
 }
 
 void
@@ -257,16 +229,18 @@ ata_dump_fdisk(ata_ctrl_t *ac, u8_t drive)
 	ata_unit_t *u=ac->drive[drive];
 	int	fdisk, s;
 
-	ATADEBUG(1,"ata_dump_fdisk(%s)\n",Ustr(u));
+	ATADEBUG(1,"ata_dump_fdisk(%s)\n",Cstr(ac));
 
 	if (!u->present) return;
 	if (u->is_atapi) return;
 
 	for(fdisk=0; fdisk<4; fdisk++) {
-		struct ata_fdisk *fp=&u->fd[fdisk];
-		u32_t 	base  = fp->base_lba;
-		u32_t 	nsec  = fp->nsectors;
-		int 	valid = fp->vtoc_valid;
+		ata_part_t *fp=&u->fd[fdisk];
+
+		u32_t 	base   = fp->base_lba;
+		u32_t 	nsec   = fp->nsectors;
+		int 	valid  = fp->vtoc_valid;
+		u8_t	active = fp->active;
 		char	*systid;
 		int	any;
 
@@ -279,7 +253,8 @@ ata_dump_fdisk(ata_ctrl_t *ac, u8_t drive)
 		if (!any && base == 0 && nsec == 0 && !valid) continue;
 
 		systid = get_sysid(u->fd[fdisk].systid);
-		printf("  fdisk=%d: Type=%-10s base_lba=%lu size=%lu %s\n",
+		printf(" %cPart=%d: Type=%-10s base_lba=%lu size=%lu %s\n",
+			active ? '+' : ' ',
 			fdisk, systid,
 			(ulong_t)base, (ulong_t)nsec,
 			valid ? "vtoc=VALID" : "");
@@ -290,7 +265,7 @@ ata_dump_fdisk(ata_ctrl_t *ac, u8_t drive)
 			if (sz == 0) continue;
 
 			printf("   %cs%02d: start=%8lu size=%8lu\n",
-				(s==ATA_WHOLE_FDISK_SLICE)?'*':' ',
+				(s==ATA_WHOLE_PART_SLICE)?'*':' ',
 				s,(ulong_t)ps,(ulong_t)sz);
 		}
 	}
@@ -300,27 +275,27 @@ int
 ata_identify(ata_ctrl_t *ac, int drive)
 {
 	ata_unit_t *u=ac->drive[drive];
-	ata_req_t r;
+	ata_req_t rb, *r=&rb;
 	u16_t 	id[256];
 	int 	i;
 
-	ATADEBUG(1,"ata_identify(%s)\n",CCstr(ac));
+	ATADEBUG(1,"ata_identify(%s)\n",Cstr(ac));
 
 	if (!ac->present) return ENODEV;
 
 	ATA_IRQ_OFF(ac,1);
 
-	bzero((caddr_t)&r,sizeof(r));
-	r.drive		= drive;
-	r.cmd		= (u->devtype & DEV_ATAPI) ? ATA_CMD_IDENTIFY_PKT 
+	bzero((caddr_t)r,sizeof(r));
+	r->drive	= drive;
+	r->cmd		= (u->devtype & DEV_ATAPI) ? ATA_CMD_IDENTIFY_PKT 
 						   : ATA_CMD_IDENTIFY;
-	r.lba_cur	= 0;
-	r.sectors_left	= 0;
-	r.chunk_left	= 0;
-	r.is_write	= 0;
-	ata_program_taskfile(ac,&r);
+	r->lba_cur	= 0;
+	r->sectors_left	= 0;
+	r->chunk_left	= 0;
+	r->is_write	= 0;
+	ata_program_taskfile(ac,r);
 
-	if (ata_wait(ac, ATA_ST_DRQ, ATA_ST_BSY, 500000) != 0) {
+	if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_BSY, 500000, 0, 0) != 0) {
 		/* no ATA device mark not present */
 		u->present = 0;
 		return ENODEV;
@@ -329,13 +304,7 @@ ata_identify(ata_ctrl_t *ac, int drive)
 	insw(ATA_DATA_O(ac),id,256);
 
 	/* Extract model string (word-swapped ASCII) */
-	for (i = 0; i < 40; i += 2) {
-		u->model[i]   = ((char *)id)[54 + i + 1];
-		u->model[i+1] = ((char *)id)[54 + i + 0];
-	}
-	i=40-1;
-	while (i > 0 && u->model[i-1] == ' ') i--;
-	u->model[i] = 0;
+	strcpy(u->model,getstr(&((char *)id)[54],40,TRUE,TRUE));
 
 	/* LBA28 capacity in words 60 61 */
 	u->nsectors = ((u32_t)id[61] << 16) | (u32_t)id[60];
@@ -346,211 +315,107 @@ ata_identify(ata_ctrl_t *ac, int drive)
 }
 
 int
-ata_pio_write(ata_ctrl_t *ac, u8_t drive, u32_t lba, int nsec, caddr_t buf)
-{
-	int 	rc=0, s, i, er;
-	u16_t 	*p;
-	u8_t 	ast, err;
-	ata_req_t r;
-
-	ATADEBUG(1,"ata_pio_write(%s)\n",CCstr(ac));
-
-	if (nsec <= 0) return EINVAL;
-
-	bzero((caddr_t)&r,sizeof(r));
-	r.drive		= drive;
-	r.lba_cur 	= lba;
-	r.nsec 		= nsec;
-	r.is_write	= 1;
-	r.addr 		= buf;
-	r.cmd		= (nsec == 1) ? ATA_CMD_WRITE_SEC 
-				      : ATA_CMD_WRITE_SEC_EXT;
-
-	ata_sel(ac,drive,lba);
-
-	while (nsec > 0) {
-		r.cmd = ATA_CMD_WRITE_SEC;
-		r.nsec = 1;
-		ata_program_taskfile(ac,&r);
-
-		if (ata_wait(ac,ATA_ST_DRQ,ATA_ST_BSY,500000) != 0) {
-			ATADEBUG(1,"ata_pio_write: no DRQ\n");
-			rc = EIO; 
-			break; 
-		}
-
-		p = (u16_t *)r.addr;
-		outsw(ATA_DATA_O(ac),p,256); 
-
-		/* settle and advance for next burst */
-		if (ata_wait(ac,ATA_ST_DRDY,ATA_ST_BSY|ATA_ST_DRQ,500000)!=0) { 
-			ATADEBUG(1,"ata_pio_write: wait error\n");
-			rc = EIO; 
-			break; 
-		}
-
-		er = ata_err(ac, &ast, &err); 	/*** Check for Error ***/
-		if (er) {
-			ATADEBUG(9,"pio_write: loop lba=%u AST=%02x Err=%02x\n",
-				lba,ast,er);
-			rc=EIO;
-			break;	
-		}
-
-		BUMP(ac,polled_sectors);
-		r.addr += ATA_SECTSIZE;
-		r.lba_cur++;
-		nsec--;
-	}
-	BUMP(ac,polled_chunks);
-	ata_wait(ac,ATA_ST_DRDY,ATA_ST_BSY,500000);
-	return rc;
-}
-
-int
-ata_pio_read(ata_ctrl_t *ac, u8_t drive, u32_t lba, int nsec, caddr_t buf)
-{
-	int	rc=0, s, i, er;
-	u16_t	*p;
-	u8_t 	ast, err;
-	ata_req_t r;
-	
-	ATADEBUG(1,"ata_pio_read(ctrl=%s,lba=%d) driv=%d nsec=%d\n",
-		CCstr(ac),lba,drive,nsec);
-
-	if (nsec <= 0) return EINVAL;
-
-	bzero((caddr_t)&r,sizeof(r));
-	r.drive		= drive;
-	r.lba_cur 	= lba;
-	r.nsec 		= nsec;
-	r.is_write	= 0;
-	r.addr 		= buf;
-	r.cmd		= (nsec == 1) ? ATA_CMD_WRITE_SEC 
-				      : ATA_CMD_WRITE_SEC_EXT;
-
-	while (nsec > 0) {
-		r.cmd  = ATA_CMD_READ_SEC;
-		r.nsec = 1;
-		ata_program_taskfile(ac,&r);
-
-		if (ata_wait(ac, ATA_ST_DRQ, ATA_ST_BSY, 500000) != 0) { 
-			ATADEBUG(1,"ata_pio_read: no DRQ\n");
-			rc = EIO; 
-			break; 
-		}
-
-		p = (u16_t *)r.addr;
-		insw(ATA_DATA_O(ac),p,256); 
-
-        	if (ata_wait(ac,ATA_ST_DRDY,ATA_ST_BSY|ATA_ST_DRQ,500000)!=0) { 
-			ATADEBUG(1,"ata_pio_read: wait error\n");
-			rc = EIO; 
-			BUMP(ac,wait_bsy_to);
-			break; 
-		}
-
-		er = ata_err(ac, &ast, &err); 	/*** Check for Error ***/
-		if (er) {
-			ATADEBUG(9,"pio_read: error AST=%02x Err=%02x\n",
-				ast,er);
-			rc=EIO;
-			break;
-		}
-
-        	r.addr  += ATA_SECTSIZE;
-		r.lba_cur++;
-		nsec--;
-	}
-	ata_wait(ac,ATA_ST_DRDY,ATA_ST_BSY,500000);
-	return rc;
-}
-
-int
 ata_flush_cache(ata_ctrl_t *ac,u8_t drive)
 {
-	ata_req_t r;
+	ata_req_t rb, *r=&rb;
 
-	ATADEBUG(1,"ata_flush_cache(%s)\n",CCstr(ac));
+	ATADEBUG(1,"ata_flush_cache(%s)\n",Cstr(ac));
 
-	bzero((caddr_t)&r,sizeof(r));
-	r.drive		= drive;
-	r.is_write	= 0;
-	r.cmd		= ATA_CMD_FLUSH_CACHE;
-	ata_program_taskfile(ac,&r);
+	bzero((caddr_t)r,sizeof(r));
+	r->drive	= drive;
+	r->is_write	= 0;
+	r->cmd		= ATA_CMD_FLUSH_CACHE;
+	ata_program_taskfile(ac,r);
 	
-	if (ata_wait(ac, ATA_ST_DRDY, ATA_ST_BSY|ATA_ST_DRQ, 2000000) != 0)
+	if (ata_wait(ac, ATA_SR_DRDY, 
+			 ATA_SR_BSY|ATA_SR_DRQ, 2000000, 0, 0) != 0)
 		return EIO;
 	return 0;
 }
 
-int
-ata_read_fdisk(ata_ctrl_t *ac, u8_t drive)
+void
+CopyTbl(ata_part_t *fp,struct ipart *ipart)
 {
+	fp->active   = ipart->bootid;
+	fp->base_lba = (u32_t)ipart->relsect;
+	fp->nsectors = (u32_t)ipart->numsect;
+	fp->systid   = (int)ipart->systid;
+}
+
+int
+ata_pdinfo(dev_t dev)
+{
+	int 	part  = ATA_PART(dev),
+		slice = ATA_SLICE(dev),
+		ctrl  = ATA_CTRL(dev),
+		drive = ATA_DRIVE(dev);
+	ata_ctrl_t *ac = &ata_ctrl[ctrl];
 	ata_unit_t *u = ac->drive[drive];
-	struct ata_fdisk *fp;
-	int	i, fdisk, rc;
 	struct mboot *mboot;
-	struct ipart *ipart;
-	ATADEBUG(1,"ata_read_fdisk(%s)\n",Ustr(u));
+	struct ipart *ip;
+	struct buf *bp;
+	ata_part_t *fp;
+	int	i, s, rc;
+
+	ATADEBUG(1,"ata_pdinfo(%s, dev=%x) drive=%d part=%d\n",	
+		Dstr(dev),dev,drive,part);
 
 	if (u->is_atapi) return 0;
 
 	mboot = (struct mboot *)kmem_alloc(DEV_BSIZE,KM_SLEEP);
 	if (!mboot) return ENOMEM;
 
-	rc = ata_pio_read(ac,drive,0,1,(caddr_t)mboot);
-	if (rc) {
+        if (ata_getblock(ABSDEV(dev),0,(caddr_t)mboot,DEV_BSIZE) != 0) {
 		kmem_free((caddr_t)mboot,DEV_BSIZE);
 		return EIO;
-	}
-	
-	u->fdisk_valid = 0;
-	for(fdisk=0; fdisk<4; fdisk++) {
-		fp=&u->fd[fdisk];
-
-		fp->base_lba   = 0;
-		fp->nsectors   = 0;
-		fp->systid     = 0;
-		fp->vtoc_valid = 0;
 	}
 
 	if (mboot->signature != MBB_MAGIC) {
 		kmem_free((caddr_t)mboot, DEV_BSIZE);
+		fp = &u->fd[ part ];
+		ATADEBUG(1,"Part %d: start=0 p_size=%lu\n",
+			part,fp->nsectors);
+		fp->slice[ATA_WHOLE_PART_SLICE].p_start = 0;
+		fp->slice[ATA_WHOLE_PART_SLICE].p_size  = fp->nsectors;
 		return 0;
 	}
 
-	u->fdisk_valid = 1;	
-	ipart = (struct ipart *)&mboot->parts[0];
-	for(fdisk=0; fdisk<4; fdisk++,ipart++) {
-		fp=&u->fd[fdisk];
-
-		fp->base_lba = ipart->relsect;
-		fp->nsectors = ipart->numsect;
-		fp->systid   = (int)ipart->systid;
-
-		fp->slice[ATA_WHOLE_FDISK_SLICE].p_start = 0;
-		fp->slice[ATA_WHOLE_FDISK_SLICE].p_size  = u->fd->nsectors;
-
-		if (fp->nsectors > 0 && fp->systid == UNIXOS) 
-			fp->vtoc_valid = ata_read_vtoc(ac,drive,fdisk);
+	/*** Now copy the others in sequence ***/
+	ip = (struct ipart *)&mboot->parts;
+	for(i=0; i<FD_NUMPART; ip++) {
+		fp = &u->fd[ i ];
+		if (ip->systid == EMPTY) continue;
+		CopyTbl(fp,ip);
+		if (ip->systid == UNIXOS) {
+			fp->slice[ATA_WHOLE_PART_SLICE].p_start = 0;
+			fp->slice[ATA_WHOLE_PART_SLICE].p_size  = fp->nsectors;
+			if (fp->nsectors > 0) {
+				fp->vtoc_valid = ata_read_vtoc(dev, i);
+			}
+		}
+		i++;
 	}
 	kmem_free((caddr_t)mboot,DEV_BSIZE);
+	/*ata_dump_fdisk(ac,drive); */
 	return 0;
 }
 
 int 
-ata_read_vtoc(ata_ctrl_t *ac,u8_t drive,int fdisk)
+ata_read_vtoc(dev_t dev,int part)
 {
+	int 	slice = ATA_SLICE(dev),
+		ctrl  = ATA_CTRL(dev),
+		drive = ATA_DRIVE(dev);
+	ata_ctrl_t *ac = &ata_ctrl[ctrl];
 	ata_unit_t *u=ac->drive[drive];
 	u32_t 	base, lba, off;
 	caddr_t k = 0;
 	struct pdinfo *pd;
 	struct vtoc *v;
-	struct ata_fdisk *fp = &u->fd[fdisk];
+	ata_part_t *fp = &u->fd[part];
 	int 	s;
 
-	ATADEBUG(1,"ata_read_vtoc(%s)\n",Ustr(u));
+	ATADEBUG(1,"ata_read_vtoc(%s dev=%x)\n",Dstr(dev),dev);
 
 	if (u->is_atapi) return 0;
 
@@ -563,9 +428,9 @@ ata_read_vtoc(ata_ctrl_t *ac,u8_t drive,int fdisk)
 	lba = base + (u32_t)VTOC_SEC;
 	if (!(k = kmem_alloc(DEV_BSIZE, KM_SLEEP))) return 0;
 
-	if (ata_pio_read(ac, drive, lba, 1, k) != 0) {
+        if (ata_getblock(ABSDEV(dev),lba,(caddr_t)k,DEV_BSIZE) != 0) {
 		kmem_free(k, DEV_BSIZE);
-		return 0;
+		return EIO;
 	}
 
 	pd = (struct pdinfo *)k;
@@ -591,16 +456,14 @@ ata_read_vtoc(ata_ctrl_t *ac,u8_t drive,int fdisk)
 	}
 
 	/* Copy slices from vtoc into our driver table. */
-	for (s = 0; s < ATA_NPART && s < V_NUMPAR; ++s) {
+	for (s = 0; s < V_NUMPAR; ++s) {
 		fp->slice[s].p_start = v->v_part[s].p_start;
 		fp->slice[s].p_size  = v->v_part[s].p_size;
 	}
 
 	/* Whole-fdisk pseudo-slice: full partition range. */
-	fp->slice[ATA_WHOLE_FDISK_SLICE].p_start = 0;
-	fp->slice[ATA_WHOLE_FDISK_SLICE].p_size  = fp->nsectors;
-
-	fp->vtoc_valid = 1;
+	fp->slice[ATA_WHOLE_PART_SLICE].p_start = 0;
+	fp->slice[ATA_WHOLE_PART_SLICE].p_size  = fp->nsectors;
 
 	kmem_free(k, DEV_BSIZE);
 	return 1;
@@ -632,28 +495,18 @@ ata_read_signature(ata_ctrl_t *ac, u8_t drive,u16_t *type)
 	if (ata_sel(ac,drive,0) != 0) return EIO;
 
 	/* Wait for not-BSY */
-	if (ata_wait(ac, 0, ATA_ST_BSY, 500000L) != 0) return EIO;
+	if (ata_wait(ac, 0, ATA_SR_BSY, 500000L, 0, 0) != 0) return EIO;
 
 	lc = inb(ATA_CYLLOW_O(ac));
 	hc = inb(ATA_CYLHIGH_O(ac));
 
 	switch ((hc<<8)|lc)
 	{
-	case 0x0000: 
-		dev = DEV_ATA|DEV_PARALLEL;
-		break;
-	case 0xC33C: 
-		dev = DEV_ATA|DEV_SERIAL;
-		break;
-	case 0xEB14: 
-		dev = DEV_ATAPI|DEV_PARALLEL;
-		break;
-	case 0x9669: 
-		dev = DEV_ATAPI|DEV_SERIAL;
-		break;
-	default:
-		dev = DEV_UNKNOWN;
-		break;
+	case 0x0000: dev = DEV_ATA|DEV_PARALLEL; 	break;
+	case 0xC33C: dev = DEV_ATA|DEV_SERIAL; 		break;
+	case 0xEB14: dev = DEV_ATAPI|DEV_PARALLEL; 	break;
+	case 0x9669: dev = DEV_ATAPI|DEV_SERIAL; 	break;
+	default:     dev = DEV_UNKNOWN;			break;
 	}
 	*type = dev;
 	return 0;
@@ -662,7 +515,6 @@ ata_read_signature(ata_ctrl_t *ac, u8_t drive,u16_t *type)
 void
 ata_attach(int ctrl)
 {
-	ata_ioque_t *que;
 	ata_ctrl_t *ac= &ata_ctrl[ctrl];
 	int 	i, drive, rc=-1;
 
@@ -670,10 +522,14 @@ ata_attach(int ctrl)
 
 	if (!ac->present) return;
 
+	if (ata_force_polling == 0) {
+		AC_SET_FLAG(ac,ACF_INTR_MODE);
+	}
 	ata_softreset_ctrl(ac);
 	for (drive = 0; drive <= 1; drive++) {
 		ata_unit_t *u = ac->drive[drive];
 
+		u->pio_multi=1;		/* 1 sector xfers */
 		ata_probe_unit(ac,drive);
 	}
 }
@@ -681,7 +537,6 @@ ata_attach(int ctrl)
 int
 ata_probe_unit(ata_ctrl_t *ac, u8_t drive)
 {
-	ata_ioque_t *que = ac->ioque;
 	ata_unit_t *u = ac->drive[drive];
 	u8_t 	lc, hc, st;
 	int 	is_pkt;
@@ -697,9 +552,9 @@ ata_probe_unit(ata_ctrl_t *ac, u8_t drive)
 
 	if (ata_identify(ac, drive) != 0) return ENXIO;
 
-	que->sync_done = 1;
-	que->tmo_id    = 0;
-	que->tmo_ticks = drv_usectohz(2000000); /* 2s is sane for PIO */
+	AC_SET_FLAG(ac, ACF_SYNC_DONE);
+	ac->tmo_id    = 0;
+	ac->tmo_ticks = drv_usectohz(2000000); /* 2s is sane for PIO */
 
 	u->present = 1;
 	if (is_pkt) {
@@ -725,13 +580,13 @@ ata_probe_unit(ata_ctrl_t *ac, u8_t drive)
 		u->media_present=mp;
 		if (u->is_cdrom) {
 			switch(u->media_present) {
-			case 0: med="CD Empty"; break;
-			case 1: med="CD Inserted"; break;
+			case 0:  med="CD Empty"; break;
+			case 1:  med="CD Inserted"; break;
 			default: med="CD ??"; break;
 			}
 		}
 		printf("%s: ATAPI %s, model=\"%s\" %s\n",
-                       Ustr(u),klass,u->model,med);
+                       Cstr(ac),klass,u->model,med);
 
 	} else { /* ATA disk branch */
 		char 	*lba28 = u->lba_ok ? "LBA28" : "";
@@ -742,14 +597,15 @@ ata_probe_unit(ata_ctrl_t *ac, u8_t drive)
 		ulong_t gib_tenths = ((nsec % 2097152UL) * 10UL) / 2097152UL;
 
 		printf("%s: ATA disk, model=\"%s\" %s, %lu sectors (%lu.%u GiB)\n",
-			Ustr(u), u->model, lba28, nsec, gib_i,gib_tenths);
+			Cstr(ac), u->model, lba28, nsec, gib_i,gib_tenths);
 
 		u->lbsize=512;
-		ata_read_fdisk(ac,drive);
 	}
 	u->lbshift=(u8_t)((u->lbsize >> 9) 
 			? (u->lbsize==512 ?0:(u->lbsize==1024 ? 1 : 2)) : 0);
-	if (atadebug>=9) ata_dump_fdisk(ac,drive);
+
+	ata_negotiate_pio_multiple(ac,drive);
+
 	return 0;
 }
 
@@ -769,9 +625,10 @@ atapi_read_capacity(ata_ctrl_t *ac, u8_t drive, u32_t *out_blocks, u32_t *out_bl
 	if (ata_sel(ac,drive,0) != 0) return EIO;
 
 	/* Program expected byte count */
-	atapi_issue_packet(ac, u, (u16_t)xfer_len);
+	atapi_issue_packet(ac, drive, (u16_t)xfer_len);
 
-	if (ata_wait(ac, ATA_ST_DRQ, ATA_ST_BSY, 200000L) != 0) return EIO;
+	if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_BSY, 200000L, 0, 0) != 0) 
+		return EIO;
 
 	/* Send 12-byte packet (6 words) */
 	for (i = 0; i < 6; i++) {
@@ -779,17 +636,18 @@ atapi_read_capacity(ata_ctrl_t *ac, u8_t drive, u32_t *out_blocks, u32_t *out_bl
 		outw(ATA_DATA_O(ac), w);
 	}
 
-	if (ata_wait(ac, ATA_ST_DRQ, ATA_ST_ERR, 500000L) != 0) return EIO;
+	if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_ERR, 500000L, 0, 0) != 0) 	
+		return EIO;
 
-	/* Read the 8-byte response (big-endian) */
-	for (i = 0; i < 4; i++) {
-		u16_t w = inw(ATA_DATA_O(ac));
-		buf[(i<<1)+0] = (u8_t)(w & 0xFF);
-		buf[(i<<1)+1] = (u8_t)(w >> 8);
+	{
+		u16_t tmp[4];
+		insw(ATA_DATA_O(ac),tmp,4);
+		for(i=0;i<4;i++) {
+			buf[(i<<1)+0] = (u8_t)(tmp[i] & 0xFF);
+			buf[(i<<1)+1] = (u8_t)(tmp[i] >> 8);
+		}
 	}
-
- 	(void)ata_wait(ac, 0, ATA_ST_BSY | ATA_ST_DRQ, 500000L);
-	er = ata_err(ac, &ast, &err); 	/*** Check for Error ***/
+ 	(void)ata_wait(ac, 0, ATA_SR_BSY | ATA_SR_DRQ, 500000L, &ast, 0);
 
 	/* Parse: [last LBA][block length]; both big-endian */
 	last_lba = ((u32_t)buf[0] << 24) | ((u32_t)buf[1] << 16) |
@@ -826,19 +684,18 @@ atapi_inquiry(ata_ctrl_t *ac, u8_t drive, u8_t *out_pdt, u8_t *out_rmb, char *ve
 	if (ata_sel(ac,drive,0) != 0) return EIO;
 
 	/* Program expected transfer size into LBA1/LBA2 (ATAPI byte-count) */
-	atapi_issue_packet(ac, u, (u16_t)xfer_len);
+	atapi_issue_packet(ac, drive, (u16_t)xfer_len);
 
 	/* Wait for DRQ to send the packet */
-	if (ata_wait(ac, ATA_ST_DRQ, ATA_ST_BSY, 200000L) != 0) return EIO;
+	if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_BSY, 200000L, 0, 0) != 0) 
+		return EIO;
 
 	/* Write the 12-byte packet as 6 words */
-	for (i = 0; i < 6; i++) {
-		u16_t w = ((u16_t)pkt[2*i+1] << 8) | pkt[2*i];
-		outw(ATA_DATA_O(ac), w);
-	}
+	outsw(ATA_DATA_O(ac), (u16_t *)pkt, 6);
 
 	/* Now the device will transfer data; poll for DRQ then read */
-	if (ata_wait(ac, ATA_ST_DRQ, ATA_ST_ERR, 500000L) != 0) return EIO;
+	if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_ERR, 500000L, 0, 0) != 0) 
+		return EIO;
 
 	/* The device sets the actual byte count to read in LBA1/LBA2 */
 	avail = ((u16_t)inb(ATA_CYLHIGH_O(ac)) << 8) |
@@ -855,8 +712,7 @@ atapi_inquiry(ata_ctrl_t *ac, u8_t drive, u8_t *out_pdt, u8_t *out_rmb, char *ve
 	}
 
 	/* Final status: wait for DRQ to clear, BSY=0, then read STATUS once */
-	(void)ata_wait(ac, 0, ATA_ST_BSY | ATA_ST_DRQ, 500000L); 
-	er = ata_err(ac, &ast, &err); 	/*** Check for Error ***/
+	(void)ata_wait(ac, 0, ATA_SR_BSY | ATA_SR_DRQ, 500000L, &ast, 0); 
 
 	/* Parse PDT and strings */
 	pdt = buf[0] & 0x1F;
@@ -868,46 +724,17 @@ atapi_inquiry(ata_ctrl_t *ac, u8_t drive, u8_t *out_pdt, u8_t *out_rmb, char *ve
 	u->atapi_pdt = pdt;
 	u->atapi_rmb = rmb;
 
-	if (vendor) {
-        	/* bytes 8..15 vendor, space padded */
-        	for (i = 0; i < 8; i++) 
-			u->vendor[i] = buf[8+i];
-        	u->vendor[8] = 0;
+	if (vendor)
+		strcpy(u->vendor,getstr((char *)&buf[8],8,FALSE,TRUE));
 
-        	/* trim */
-        	for (i = 7; i >= 0 && u->vendor[i]==' '; i--) 
-			u->vendor[i]=0;
-	}
-
-	if (product) {
-		/* bytes 16..31 product */
-		int j;
-		for (i = 0; i < 16; i++) 
-			u->product[i] = buf[16+i];
-		u->product[16]=0;
-		for (j = 15; j >= 0 && u->product[j]==' '; j--) 
-			u->product[j]=0;
-	}
+	if (product)
+		strcpy(u->product,getstr((char *)&buf[16],16,FALSE,TRUE));
 
 	/* Map "ZIP" style PDT 0x00 + RMB=1 is removable disk (ZIP/MO) */
 	if (pdt == 0x00 && rmb) {
 		/* you can special-case print as "ZIP/Removable Disk" */
 	}
 	return 0;
-}
-
-char *
-atapi_class_name(u8_t pdt, int rmb)
-{
-	switch (pdt) {
-	case 0x00: return rmb ? "Removable Disk (ZIP/MO)":"Direct-Access Disk";
-	case 0x05: return "CD/DVD"; 
-	case 0x01: return "Tape";
-	case 0x04: return "WORM";
-	case 0x07: return "Optical Memory";
-	case 0x0E: return "Simplified Direct-Access";
-	default:   return "Unknown ATAPI";
-	}
 }
 
 int
@@ -980,13 +807,12 @@ atapi_packet(ata_ctrl_t *ac, u8_t drive, u8_t *cdb, int cdb_len, void *buf, u32_
 
 	/* Step 2: data/status loop (polled) */
 	for (;;) {
-		/* Wait BSY clear */
-		do { st = inb(ATA_ALTSTATUS_O(ac)); } while (st & ATA_ST_BSY);
+		/* Wait for BSY to clear */
+		ata_wait(ac, 0, ATA_SR_BSY, 1000000L, &st, 0);
 
 		/* If DRQ dropped, command is finishing; read final STATUS */
-		if ((st & ATA_ST_DRQ) == 0) {
-			st = inb(ATA_ALTSTATUS_O(ac));
-			if (st & (ATA_ST_ERR | ATA_ST_DF)) {
+		if ((st & ATA_SR_DRQ) == 0) {
+			if (st & (ATA_SR_ERR | ATA_SR_DWF)) {
 				errreg = inb(ATA_FEAT_O(ac));
 				(void)errreg;
 				rc = EIO;
@@ -1060,78 +886,17 @@ sense_or_fail:
 		(void)inb(ATA_ALTSTATUS_O(ac));
 		(void)ata_send_packet(ac,drive, rs_cdb, 12);
 
-		/* Wait for DRQ to read sense data (simple, short transfer) */
-		spins = 100000;
-		while (spins--) {
-			st = inb(ATA_ALTSTATUS_O(ac));
-			if (!(st & ATA_ST_BSY) && (st & ATA_ST_DRQ))
-				break;
-			drv_usecwait(1); /* ata_udelay(1);*/
-		}
-		if (spins > 0) {
+		if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_BSY, 100000, &st, 0) == 0) {
 			u16_t want = (u16_t)((sense_len < 18) ? sense_len : 18);
-			u16_t wds = (u16_t)((int)(want + 1) >> 1);
-			for (w = 0; w < wds; ++w)
+			u16_t wds  = (u16_t)((int)(want+1) >> 1);
+			for(w=0; w < wds; w++)
 				*(((u16_t *)sense) + w) = inw(ATA_DATA_O(ac));
 			(void)inb(ATA_ALTSTATUS_O(ac));
+		
 		}
 	}
 
 	return (rc != 0) ? rc : EIO;
-}
-
-int
-do_atapi_strategy(struct buf *bp)
-{
-	dev_t	   dev=bp->b_edev;
-	ata_ctrl_t *ac = &ata_ctrl[ATA_CTRL(dev)];
-	ata_ioque_t *que  = ac->ioque;
-	int        drive = ATA_DRIVE(dev);
-	ata_unit_t *u   = ac->drive[drive];
-	u32_t      base_lba, region_len;
-	u32_t      bsz512, lba10, left, step;
-	u16_t      nblks;
-	char      *addr;
-
-	ATADEBUG(1,"do_atapi_strategy(%s)\n",Ustr(u));
-
-	if (!(bp->b_flags & B_READ)) return berror(bp,que,0,EROFS);
-
-	if (u->atapi_blksz != 2048) return berror(bp,que,0,EINVAL);
-
-	/* Map region (512B sectors) and compute */
-	ata_region_from_dev(dev, &base_lba, &region_len);
-	bsz512 = 2048U >> 9;     /* = 4 */
-	if ((base_lba % bsz512) != 0 || ((bp->b_bcount >> 9) % bsz512) != 0)
-		return berror(bp,que,0,EINVAL);
-
-	left = (u32_t)bp->b_bcount >> 9;  /* 512B sectors */
-	addr = (char *)bp->b_un.b_addr;
-
-	while (left > 0) {
-		lba10 = (base_lba / bsz512);
-		nblks = (u16_t)((left / bsz512) > 0xFFFFU ? 0xFFFFU 
-							  : (left / bsz512));
-		if (nblks == 0) break;
-
-		if (atapi_read10(ac,drive, lba10, nblks, addr)) return berror(bp,que,0,EIO);
-
-		step     = (u32_t)nblks * bsz512;   /* in 512B sectors */
-		base_lba += step;
-		left     -= step;
-		addr     += (u32_t)nblks * 2048U;
-	}
-
-	return bok(bp,que,0);
-}
-
-void
-ata_dump_regs(ata_ctrl_t *ac, char *tag)
-{
-	u8_t	ast = inb(ATA_ALTSTATUS_O(ac));
-	u8_t	er = inb(ATA_ERROR_O(ac));
-	ATADEBUG(5,"[%s] %s: AST=%02x ER=%02x\n",
-		CCstr(ac),tag,ast,er);
 }
 
 void
@@ -1139,22 +904,26 @@ ata_quiesce_ctrl(ata_ctrl_t *ac)
 {
 	int	pass;
 	u8_t 	ast, st;
-	u16_t	bc, words;
+	u16_t	words, bc, chunk, scratch[256];
 
-	ATADEBUG(9,"ata_quiesce_ctrl(%s)\n",CCstr(ac));
-	ata_wait(ac,0,ATA_ST_BSY,500000);
+	ATADEBUG(9,"ata_quiesce_ctrl(%s)\n",Cstr(ac));
+	ata_wait(ac, 0, ATA_SR_BSY, 500000, 0, 0);
 
 	for(pass=0; pass<2; pass++) {
 		ast = inb(ATA_ALTSTATUS_O(ac));
-		if (ast & ATA_ST_BSY) break;
-		if (!(ast & ATA_ST_DRQ)) break;
+		if (ast & ATA_SR_BSY) break;
+		if (!(ast & ATA_SR_DRQ)) break;
 
 		bc = (inb(ATA_CYLHIGH_O(ac)) << 8) |	
 		      inb(ATA_CYLLOW_O(ac));
 		if (bc == 0) bc=65536;
 
-		words=bc>>1;
-		while (words--) inw(ATA_DATA_O(ac));
+		words = bc>>1;
+		while (words) {
+			u16_t chunk = (words > 256) ? 256 : words;
+			insw(ATA_DATA_O(ac),scratch,chunk);
+			words -= chunk;
+		}
 
 		inb(ATA_ALTSTATUS_O(ac));
 	}
@@ -1168,55 +937,59 @@ ata_dump_stats(void)
 	int	ctrl, driv;
 
 	for(ctrl=0; ctrl<ATA_MAX_CTRL; ctrl++) {
-		ata_ctrl_t *c= &ata_ctrl[ctrl];
-		ata_unit_t *u0 = c->drive[0];
-		ata_unit_t *u1 = c->drive[1];
+		ata_ctrl_t *ac= &ata_ctrl[ctrl];
+		ata_unit_t *u0 = ac->drive[0];
+		ata_unit_t *u1 = ac->drive[1];
 
-		if (!c->present) continue;
+		if (!ac->present) continue;
 			
-		printf("ATA%d: intrmode=%d present(%d,%d) turnon=%lu turnoff=%lu\n",
-			ctrl, c->intr_mode,
+		printf("ATA%d: intrmode=%d flag=%08x present(%d,%d) turnon=%lu turnoff=%lu\n",
+			ctrl, AC_HAS_FLAG(ac,ACF_INTR_MODE),ac->flags,
 			u0 ? u0->present : 0,
 			u1 ? u1->present : 0,
-			c->counters.irq_turnon,
-			c->counters.irq_turnoff);
+			ac->counters->irq_turnon,
+			ac->counters->irq_turnoff);
  		printf("      IRQ: seen=%lu handled=%lu spurious=%lu nocur=%lu bsy=%lu drq_service=%lu\n",
-			c->counters.irq_seen, 
-			c->counters.irq_handled, 
-			c->counters.irq_spurious,
-			c->counters.irq_no_cur,
-			c->counters.irq_bsy_skipped,
-			c->counters.irq_drq_service);
+			ac->counters->irq_seen, 
+			ac->counters->irq_handled, 
+			ac->counters->irq_spurious,
+			ac->counters->irq_no_cur,
+			ac->counters->irq_bsy_skipped,
+			ac->counters->irq_drq_service);
  		printf("      eoc=%lu eoc_polled=%lu lost_irq_rescued=%lu softresets=%lu\n",
-			c->counters.irq_eoc, 
-			c->counters.eoc_polled,
-			c->counters.lost_irq_rescued,
-			c->counters.softresets);
+			ac->counters->irq_eoc, 
+			ac->counters->eoc_polled,
+			ac->counters->lost_irq_rescued,
+			ac->counters->softresets);
  		printf("      WD: arm=%lu cancel=%lu fired=%lu service=%lu rekicked=%lu chunk=%ld\n",
-			c->counters.wd_arm,
-			c->counters.wd_cancel,
-			c->counters.wd_fired,
-			c->counters.wd_serviced, 
-			c->counters.wd_rekicked,
-			c->counters.wd_chunk);
+			ac->counters->wd_arm,
+			ac->counters->wd_cancel,
+			ac->counters->wd_fired,
+			ac->counters->wd_serviced, 
+			ac->counters->wd_rekicked,
+			ac->counters->wd_chunk);
 	}
 }
 
 void
 ata_softreset_ctrl(ata_ctrl_t *ac)
 {
-	int	was_enabled = ac->irq_enabled;
+	int	was_enabled = AC_HAS_FLAG(ac,ACF_IRQ_ON);
 
 	ATADEBUG(1,"ata_softreset_ctrl(%d)\n",ac->idx);
 	BUMP(ac,softresets);
-	ATA_IRQ_OFF(ac,1);
+	/*ATA_IRQ_OFF(ac,1);*/
+	AC_CLR_FLAG(ac,ACF_IRQ_ON); /* Clear the flag */
 	outb(ATA_DEVCTRL_O(ac), ATA_CTL_SRST | ATA_CTL_NIEN);
 	drv_usecwait(5);
 	outb(ATA_DEVCTRL_O(ac), ATA_CTL_NIEN); /* deassert SRST */
 	drv_usecwait(5);
 	(void)inb(ATA_ALTSTATUS_O(ac));
 
-	if (was_enabled) ATA_IRQ_ON(ac);
+	if (was_enabled) {
+		printf("Was enabled so re-enabling\n");
+		ATA_IRQ_ON(ac);
+	}
 }
 
 int
@@ -1239,4 +1012,317 @@ atapi_test_unit_ready(ata_ctrl_t *ac, u8_t drive, int *p_media_present)
 	}
 	if (p_media_present) *p_media_present = -1;
 	return 0;
+}
+
+int
+ata_enable_pio_multiple(ata_ctrl_t *ac, u8_t drive, u8_t multi)
+{
+	u8_t	ast, err;
+
+	if (!multi || multi <= 1) return 0;
+
+	ata_sel(ac,drive,0);
+
+	outb(ATA_SECTCNT_O(ac),multi);
+	outb(ATA_CMD_O(ac),ATA_CMD_SET_MULTI);
+	ata_delay400(ac);
+
+	if (ata_wait(ac, 0, ATA_SR_BSY, 1000000, &ast, &err) != 0) return -1;
+	if (ast & (ATA_SR_ERR|ATA_SR_DWF))  return -1;
+
+	return 0;
+}
+
+/* Negotiate a valid multi-sector count: try 16/8/4/2 (or 8/4/2) based on policy. */
+void
+ata_negotiate_pio_multiple(ata_ctrl_t *ac, u8_t drive)
+{
+    u8_t target = (ATA_USE_MAX_MULTIPLE ? 16 : 8);
+    u8_t n;
+    if (target > 16) target = 16;
+    if (target < 2)  target = 2;
+
+    for (n = target; n >= 2; n >>= 1) {
+	if (ata_enable_pio_multiple(ac,drive,n) == 0) {
+            ac->pio_multi = n;
+            printf("%s: PIO multiple negotiated = %u\n", 
+			Cstr(ac), ac->pio_multi);
+            return;
+        }
+    }
+    ac->pio_multi = 1;
+    ATADEBUG(1, "%s: PIO multiple not supported, using single-sector\n",
+		Cstr(ac));
+}
+
+int
+ata_err(ata_ctrl_t *ac, u8_t *ast, u8_t *err)
+{
+	u8_t	x, y;
+
+	x = inb(ATA_ALTSTATUS_O(ac));
+	*ast = (x & 0xff);
+	if ((x & (ATA_SR_BSY|ATA_SR_DRQ)) == 0) {
+		y = inb(ATA_ERROR_O(ac));
+		if (err) *err=y;
+		return (u8_t)(x & (ATA_SR_ERR | ATA_SR_DWF)) ? EIO : 0;
+	}
+	return 0;
+}
+
+void
+ata_region_from_dev(dev_t dev, u32_t *out_base, u32_t *out_len)
+{
+	ata_ctrl_t *ac = &ata_ctrl[ATA_CTRL(dev)];
+	ata_unit_t *u = &ata_unit[ATA_UNIT(dev)];
+	int	part  = ATA_PART(dev);
+	int	slice = ATA_SLICE(dev);
+	u32_t	base=0, len=0, bsz512;
+	ata_part_t *fp = &u->fd[part];
+
+	ATADEBUG(1,"ata_region_from_dev(%s base=%lu, start=%lu)\n",
+		Dstr(dev), (u32_t)fp->base_lba, 
+		(u32_t)fp->slice[slice].p_start);
+
+	if (u->is_atapi) {
+        	bsz512 = (u->lbsize >> 9) ? (u->lbsize >> 9) : 1;
+        	base = 0;
+        	len  = u->atapi_blocks * bsz512;
+	} else {
+		if (ISABSDEV(dev)) {
+			base = 0;
+			len  = u->nsectors;
+		} else {
+			base = fp->base_lba;
+			len  = fp->nsectors;
+
+			if (fp->systid == UNIXOS) {
+				if (slice != 0 && 
+				    slice != ATA_WHOLE_PART_SLICE) {
+					base += fp->slice[slice].p_start-1;
+					len    = fp->slice[slice].p_size;
+				}
+			}
+		}
+	}
+	ATADEBUG(5,"region_from_dev: %s part_base=%lu slice_start=%lu final_base=%lu\n",
+		Dstr(dev),fp->base_lba,fp->slice[slice].p_start,base);
+
+	*out_base = base;
+	*out_len  = len;
+	return;
+}
+
+void
+reset_queue(ata_ctrl_t *ac,int hard)
+{
+	ata_ioque_t *q=ac->ioque;
+
+	ATADEBUG(2,"reset_queue()\n");
+	if (ac->tmo_id) {
+    		untimeout(ac->tmo_id);
+    		ac->tmo_id = 0;
+	}
+	/* Soft reset of the channel engine; do NOT free xfer_buf here. */
+	q->cur       = 0;
+	q->state     = AS_IDLE;
+	AC_CLR_FLAG(ac, ACF_BUSY);
+}
+
+char *
+get_sysid(u8_t systid)
+{
+	switch(systid) {
+	case EMPTY:		return "Empty";
+	case UNUSED:		return "Unused";
+	case FAT12:		return "FAT12";
+	case PCIXOS:		return "PCIXOS";
+	case FAT16:		return "FAT16";
+	case EXTDOS:		return "EXTDOS";
+	case NTFS:		return "NTFS";
+	case DOSDATA:		return "DOSDATA";
+	case OTHEROS:		return "OTHEROS";
+	case SVR4:		return "Unix SVR4";
+	case LINUXSWAP:		return "Linux Swap";
+	case LINUXNATIVE:	return "Linux";
+	case BSD386:		return "BSD386";
+	case OPENBSD:		return "OpenBSD";
+	case NETBSD:		return "NetBSD";
+	case SOLARIS:		return "Solaris";
+	}
+	return "??";
+}
+
+char *
+atapi_class_name(u8_t pdt, int rmb)
+{
+	switch (pdt) {
+	case 0x00: return rmb ? "Removable Disk (ZIP/MO)":"Direct-Access Disk";
+	case 0x05: return "CD/DVD"; 
+	case 0x01: return "Tape";
+	case 0x04: return "WORM";
+	case 0x07: return "Optical Memory";
+	case 0x0E: return "Simplified Direct-Access";
+	default:   return "Unknown ATAPI";
+	}
+}
+
+char *
+Istr(int cmd)
+{
+	switch (cmd) {
+	case V_CONFIG:	 return "V_CONFIG";
+	case V_REMOUNT:  return "V_REMOUNT";
+	case V_GETPARMS: return "V_GETPARMS";
+	case V_FORMAT: 	 return "V_FORMAT";
+	case V_PDLOC: 	 return "V_PDLOC";
+	case V_RDABS: 	 return "V_RDABS";
+	case V_WRABS:	 return "V_WRABS";
+	case V_VERIFY:	 return "V_VERIFY";
+	default:	 return "V_default";
+	}
+}
+
+char *
+Cstr(ata_ctrl_t *ac) 
+{
+static	char	buf[20];
+	int	d=ac->sel_drive;
+	int	c=ac->idx;
+	ata_unit_t *u = ac->drive[d];
+	dev_t	dev=ATA_DEV(c,d);
+	char 	*suffix=ISABSDEV(dev) ? " <ABSDEV>" : "";
+
+	sprintf(buf,"c%dd%d%s",c,d,suffix);
+	return buf;
+}
+
+char *
+Dstr(dev_t dev)
+{
+static	char	buf[50];
+	char 	*suffix=ISABSDEV(dev) ? " <ABSDEV>" : "";
+	int 	ctrl = ATA_CTRL(dev), 
+		unit = ATA_UNIT(dev), 
+		driv = ATA_DRIVE(dev), 
+		fdisk = ATA_PART(dev),
+		slice = ATA_SLICE(dev);
+	sprintf(buf,"c%dd%dp%ds%d%s",ctrl,driv,fdisk,slice,suffix);
+	return buf;
+}
+
+char *
+getstr(char *ptr, int len, int swap, int blanks)
+{
+static	char	buf[50];
+	int	i;
+	
+	for(i=0;i<len;i++) {
+		buf[i]=ptr[i];
+		if (swap && i%2) {
+			buf[i]   = ptr[i-1];
+			buf[i-1] = ptr[i];
+		}
+	}
+	if (blanks) {
+		i=len;
+		while (i > 0 && buf[i-1] == ' ') i--;
+		buf[i] = 0;
+	}
+	return buf;
+} 
+
+void
+ata_rescue()
+{
+	ata_ctrl_t *ac= &ata_ctrl[1];
+
+	ata_rescue(ac);
+}
+
+void
+ata_rescueit(ata_ctrl_t *ac)
+{
+	int	s;
+	ata_ioque_t *q;
+
+	if (!ac) return;
+
+	s = splbio();
+	q = ac->ioque;
+	if (!q || !q->cur) { splx(s); return; }
+
+	if (ac->tmo_id) {
+		untimeout(ac->tmo_id);
+		ac->tmo_id = 0;
+	}
+	splx(s);
+
+	ata_finish_current(ac,EIO,97);
+	need_kick(ac);
+}
+
+void
+ATADEBUG(int x, char *fmt, ...) 
+{
+	if (atadebug >= x) 
+		xprintf(fmt,(u32_t)((u32_t *)&fmt+1));
+}
+
+int 	
+ata_getblock(dev_t dev, daddr_t blkno, caddr_t buf, u32_t count)
+{
+	int	rc;
+	struct buf *bp; 
+
+	ATADEBUG(1,"ata_getblock(%x,%lu,%x,%lu)\n",dev,blkno,buf,count);
+
+	if (!(bp = geteblk())) return EIO;
+
+	bp->b_dev    = dev;
+	bp->b_edev   = dev;
+	bp->b_error  = 0;
+	bp->b_resid  = 0;
+	bp->b_flags  = B_READ | B_BUSY;
+	bp->b_blkno  = blkno;
+	bp->b_bcount = count;
+	/* bp->b_reqcnt = */ 		/* Req Count */
+
+	atastrategy(bp);
+	iowait(bp);
+
+	rc = (bp->b_flags & B_ERROR) ? EIO : 0;
+	bcopy(bp->b_un.b_addr,buf,count);
+	dumpbuf("GETBLOCK", bp->b_blkno, buf);
+	brelse(bp);
+
+	return rc;
+}
+
+int 	
+ata_putblock(dev_t dev, daddr_t blkno, caddr_t buf, u32_t count)
+{
+	int rc;
+	struct buf *bp; 
+
+	ATADEBUG(1,"ata_putblock(%x,%lu,%x,%lu)\n",dev,blkno,buf,count);
+
+	if (!(bp = geteblk())) return EIO;
+
+	bp->b_dev    = dev;
+	bp->b_edev   = dev;
+	bp->b_error  = 0;
+	bp->b_resid  = 0;
+	bp->b_flags  = B_WRITE | B_BUSY;
+	bp->b_blkno  = blkno;
+	bp->b_bcount = count;
+
+	bcopy(buf, bp->b_un.b_addr, count);
+	dumpbuf("PUTBLOCK", bp->b_blkno, bp->b_un.b_addr);
+
+	atastrategy(bp);
+	iowait(bp);
+	rc = (bp->b_flags & B_ERROR) ? EIO : 0;
+	brelse(bp);
+	return rc;
 }

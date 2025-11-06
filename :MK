@@ -11,7 +11,8 @@ set -x
 cc -I. -D_KERNEL -DSYSV -DSVR40 -DAT386 -DVPIX -DWEITEK -DMERGE386 -DBLTCONS -DEVGA -c ata_core.c
 cc -I. -D_KERNEL -DSYSV -DSVR40 -DAT386 -DVPIX -DWEITEK -DMERGE386 -DBLTCONS -DEVGA -c ata_hw.c
 cc -I. -D_KERNEL -DSYSV -DSVR40 -DAT386 -DVPIX -DWEITEK -DMERGE386 -DBLTCONS -DEVGA -c ata_queue.c
-ld -r -o Driver.o ata_core.o ata_hw.o ata_queue.o
+cc -I. -D_KERNEL -DSYSV -DSVR40 -DAT386 -DVPIX -DWEITEK -DMERGE386 -DBLTCONS -DEVGA -c ata_xfer.c
+ld -r -o Driver.o ata_core.o ata_hw.o ata_queue.o ata_xfer.o
 
 echo "Installing Driver and space.c"
 mkdir -p /etc/conf/pack.d/ata 2>/dev/null
