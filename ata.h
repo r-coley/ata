@@ -373,6 +373,7 @@ struct ata_counters
 #define CDB_START_STOP_UNIT     0x1B
 #define CDB_PREVENT_ALLOW       0x1E
 #define CDB_READ_10             0x28
+#define CDB_WRITE_10            0x2A
 #define CDB_READ_CAPACITY       0x25
 
 /* Minor layout (USL-style, extended) ----------
@@ -509,6 +510,7 @@ int 	atapi_read_capacity(ata_ctrl_t *ac, u8_t, u32_t *, u32_t *);
 int 	atapi_inquiry(ata_ctrl_t *, u8_t,u8_t *, u8_t *, char *, char *);
 char 	*atapi_class_name(u8_t, int);
 int 	atapi_read10(ata_ctrl_t *, u8_t, u32_t, u16_t,void *);
+int 	atapi_write10(ata_ctrl_t *, u8_t, u32_t, u16_t,const void *);
 int 	atapi_mode_sense10(ata_ctrl_t *, u8_t, u8_t, u8_t, void *, u16_t);
 int 	atapi_mode_sense6(ata_ctrl_t *, u8_t, u8_t, u8_t, void *, u8_t);
 int 	atapi_packet(ata_ctrl_t *, u8_t, u8_t *, int, void *, u32_t, int, u8_t *, int );
@@ -551,5 +553,7 @@ int 	ata_putblock(dev_t, daddr_t, caddr_t, u32_t);
 void 	dumpbuf(char *, u32_t, char *);
 int 	ata_fdisk();
 void 	ata_negotiate_pio_multiple(ata_ctrl_t *, u8_t);
+void 	ata_rescue(int);
+void 	ata_rescueit(ata_ctrl_t *);
 
 #endif /* _ATA_H */

@@ -9,12 +9,12 @@
 /* Exported globals expected by SVR4 */
 int 	atadevflag = D_NEW | D_DMA;
 int	atadebug   = 0;
-int 	ata_force_polling = 0;
+int 	ata_force_polling = 1;
 
 ata_ctrl_t ata_ctrl[ATA_MAX_CTRL] = {
 	{ 0x1F0, 14, 0 }, /* c0 (Primary)   */
 	{ 0x170, 15, 1 }, /* c1 (Secondary) */
-	{ 0x1E8, 11, 0 }, /* c2 (Tertiary) */
+	{ 0x1E8, 11, 1 }, /* c2 (Tertiary) */
 	{ 0x168, 10, 0 }  /* c3 (Quaternary) */
 };
 
@@ -44,7 +44,7 @@ ataopen(dev_t *devp, int flags, int otyp, cred_t *crp)
 		Dstr(dev),u->present,dev,fdisk,ctrl,drive,slice);
 
 	if (!u->present) return ENXIO;
-	if ((u->read_only || u->is_atapi) && (flags & FWRITE)) return EROFS;
+	if ((u->read_only || u->is_cdrom) && (flags & FWRITE)) return EROFS;
 
 	if (ISABSDEV(dev)) return ENXIO;
 
@@ -140,7 +140,6 @@ ataclose(dev_t dev, int flags, int otyp, cred_t *crp)
 	while (AC_HAS_FLAG(ac,ACF_BUSY) || q->q_head) {
 		printf("busy=%d q_head=%lx\n",AC_HAS_FLAG(ac,ACF_BUSY),q->q_head);
 		sleep((caddr_t)ac->ioque,PRIBIO);
-		printf("Woken1 on ac->ioque flags=%08x\n",ac->flags);
 	}
 
 	if (q->open_count > 0) q->open_count--;
@@ -185,19 +184,31 @@ atastrategy(struct buf *bp)
 	r = (ata_req_t *)kmem_zalloc(sizeof(*r),KM_SLEEP);
 	if (!r) return berror(bp,0,ENOMEM);
 
-	r->is_write	= (bp->b_flags & B_READ) ? 0 : 1;
-	r->reqid 	= req_seq++;
-	r->drive        = ATA_DRIVE(dev);
-	r->lba          = base + (u32_t)bp->b_blkno;
-	r->lba_cur      = base + (u32_t)bp->b_blkno;
-	r->addr         = (char *)bp->b_un.b_addr;
-	r->nsec         = (u32_t)(bp->b_bcount >> 9);
-	r->sectors_left = (u32_t)(bp->b_bcount >> 9);
-	r->bp 		= bp;
-	r->cmd 		= multicmd(ac,r->is_write,bp->b_blkno,r->nsec);
+	r->is_write = (bp->b_flags & B_READ) ? 0 : 1;
+	r->reqid    = req_seq++;
+	r->drive    = ATA_DRIVE(dev);
+	r->addr     = (char *)bp->b_un.b_addr;
+	r->bp 	    = bp;
+
+	if (u->is_atapi) {
+		u32_t blksz = u->atapi_blksz ? u->atapi_blksz : 2048;
+		u32_t bsz512 = blksz >> 9;
+		if (bsz512 == 0) bsz512=1;
+
+		r->lba          = base / bsz512 + (u32_t)bp->b_blkno / bsz512;
+		r->lba_cur      = r->lba;
+		r->nsec         = (u32_t)(bp->b_bcount / blksz);
+		r->sectors_left = r->nsec;
+		r->cmd		= ATA_CMD_PACKET;
+	} else {
+		r->lba          = base + (u32_t)bp->b_blkno;
+		r->lba_cur      = r->lba;
+		r->nsec         = (u32_t)(bp->b_bcount >> 9);
+		r->sectors_left = r->nsec;
+		r->cmd 		= multicmd(ac,r->is_write,bp->b_blkno,r->nsec);
+	}
 
 	ata_pushreq(ac,r);
-
 	return 0;
 }
 

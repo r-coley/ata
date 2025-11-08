@@ -4,105 +4,6 @@
 
 #include "ata.h"
 
-char atalogmsg[200];
-
-int
-do_ata_strategy(struct buf *bp)
-{
-	dev_t	dev=bp->b_edev;
-	ata_ctrl_t *ac = &ata_ctrl[ATA_CTRL(dev)];
-	ata_ioque_t *q = ac->ioque;
-	ata_unit_t *u = ac->drive[ATA_DRIVE(dev)];
-	u32_t   base, len, lba, left;
-	u8_t	drive = u->drive;
-	char    *addr;
-	ata_req_t rb, *r=&rb;
-	int     s, is_write;
-
-	ATADEBUG(1,"do_ata_strategy()\n");
-
-	/* Map region (512-byte sectors) */
-	ata_region_from_dev(dev, &base, &len);
-	if (len == 0) return berror(bp,0,ENXIO);
-
-	/* Request geometry from bp */
-	lba      = base + (u32_t)bp->b_blkno;        /* 512B sectors */
-	left     = (u32_t)(bp->b_bcount >> 9);       /* 512B sectors */
-	addr     = (char *)bp->b_un.b_addr;
-	is_write = ((bp->b_flags & B_READ) == 0);
-
-	ATADEBUG(5,"do_ata_strategy(%s): build req lba=%lu nsec=%lu bytes=%u is_write=%d buf=%lx\n",
-		Cstr(ac),lba,left,bp->b_bcount,is_write,addr);
-
-	/* Polled PIO fallback: split into <=256-sector commands */
-	while (left > 0) {
-		u32_t 	chunk = (left > 256U) ? 256U : left;
-		int	rc;
-	
-		bzero((caddr_t)r,sizeof(r));
-		r->is_write	= is_write;
-		r->reqid	= req_seq++;
-		r->drive	= drive;
-		r->lba_cur 	= lba;
-		r->addr 	= addr;
-		r->nsec 	= chunk;
-
-		rc = is_write ? ata_pio_write(ac, r) : ata_pio_read (ac, r);
-
-		if (rc) return berror(bp,0,EIO);
-
-		lba  += chunk;
-		left -= chunk;
-		addr += (chunk << 9);                /* bytes */
-	}
-	return bok(bp,0);
-}
-
-int
-do_atapi_strategy(struct buf *bp)
-{
-	dev_t	   dev=bp->b_edev;
-	ata_ctrl_t *ac = &ata_ctrl[ATA_CTRL(dev)];
-	ata_ioque_t *q  = ac->ioque;
-	int        drive = ATA_DRIVE(dev);
-	ata_unit_t *u   = ac->drive[drive];
-	u32_t      base_lba, region_len;
-	u32_t      bsz512, lba10, left, step;
-	u16_t      nblks;
-	char	   *addr;
-
-	ATADEBUG(1,"do_atapi_strategy(%s)\n",Cstr(ac));
-
-	if (!(bp->b_flags & B_READ)) return berror(bp,0,EROFS);
-
-	if (u->atapi_blksz != 2048) return berror(bp,0,EINVAL);
-
-	/* Map region (512B sectors) and compute */
-	ata_region_from_dev(dev, &base_lba, &region_len);
-	bsz512 = 2048U >> 9;     /* = 4 */
-	if ((base_lba % bsz512) != 0 || ((bp->b_bcount >> 9) % bsz512) != 0)
-		return berror(bp,0,EINVAL);
-
-	left = (u32_t)bp->b_bcount >> 9;  /* 512B sectors */
-	addr = (char *)bp->b_un.b_addr;
-
-	while (left > 0) {
-		lba10 = (base_lba / bsz512);
-		nblks = (u16_t)((left / bsz512) > 0xFFFFU ? 0xFFFFU 
-							  : (left / bsz512));
-		if (nblks == 0) break;
-
-		if (atapi_read10(ac,drive, lba10, nblks, addr)) return berror(bp,0,EIO);
-
-		step     = (u32_t)nblks * bsz512;   /* in 512B sectors */
-		base_lba += step;
-		left     -= step;
-		addr     += (u32_t)nblks * 2048U;
-	}
-
-	return bok(bp,0);
-}
-
 int
 ata_pio_read(ata_ctrl_t *ac, ata_req_t *r)
 {
@@ -327,6 +228,61 @@ ata_program_taskfile(ata_ctrl_t *ac, ata_req_t *r)
 
 int 
 ata_program_next_chunk(ata_ctrl_t *ac, ata_req_t *r,int arm_ticks)
+{
+	if (r->cmd == ATA_CMD_PACKET)
+		return ata_issue_packet(ac,r,arm_ticks);
+	else
+		return ata_issue_pio_rw(ac,r,arm_ticks);
+}
+
+int
+ata_issue_packet(ata_ctrl_t *ac,ata_req_t *r,int arm_ticks)
+{
+	ata_unit_t *u = ac->drive[r->drive];
+	u8_t	cdb[12], sense[18];
+	u16_t	nblks;
+	u32_t	blksz, xfer;
+	int	dir, rc;
+
+	if (r->sectors_left == 0) return 0;
+
+	blksz = u->atapi_blksz ? u->atapi_blksz : 2048;
+
+	nblks = (r->sectors_left > 0xFFFFU) ? 0xFFFFU : (u16_t)r->sectors_left;
+
+	bzero((caddr_t)cdb, sizeof(cdb));
+	cdb[0] = r->is_write ? CDB_WRITE_10 : CDB_READ_10;
+	
+	cdb[2] = (u8_t)((r->lba_cur >> 24) & 0xff);
+	cdb[3] = (u8_t)((r->lba_cur >> 16) & 0xff);
+	cdb[4] = (u8_t)((r->lba_cur >>  8) & 0xff);
+	cdb[5] = (u8_t)((r->lba_cur >>  0) & 0xff);
+
+	cdb[7] = (u8_t)((nblks >> 8) & 0xff);
+	cdb[8] = (u8_t)((nblks >> 0) & 0xff);
+
+	xfer = (u32_t)nblks * blksz;
+
+	dir = r->is_write ? 0 : 1;
+
+	rc = atapi_packet(ac, r->drive, cdb, sizeof(cdb),(void *)r->addr, 
+			  xfer, dir, sense,sizeof(sense));
+	if (rc == 0) {
+		r->lba_cur      += nblks;
+		r->addr         += xfer;
+		r->sectors_left -= nblks;
+
+		r->xfer_off    += xfer;
+		r->chunk_bytes = xfer;
+		r->flags       &= ~ATA_RF_NEEDCOPY;
+	} else {
+		/* Decode sense here */
+	}
+	return rc;
+}
+
+int 
+ata_issue_pio_rw(ata_ctrl_t *ac,ata_req_t *r,int arm_ticks)
 {
 	u32_t 	n;
 	size_t 	bytes;

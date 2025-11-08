@@ -123,41 +123,54 @@ ata_delay400(ata_ctrl_t *c)
 int
 ata_send_packet(ata_ctrl_t *ac, u8_t drive, const u8_t *cdb, int cdb_len)
 {
-	u8_t 	st, errreg;
-	u16_t 	words_cdb[6];
-	int 	i, spins;
+	ata_unit_t *u = ac->drive[drive];
+	u8_t 	ast, err, ir;
+	u16_t 	words_cdb[6], bc;
+	int 	i, attempt;
 
 	ATADEBUG(1,"ata_send_packet(%s)\n",Cstr(ac));
 
-	/* Select device */
-	ata_sel(ac,drive,0);
+	for(attempt=0; attempt<2; attempt++) {
+		if (attempt == 1) {
+			outb(ATA_DEVCTRL_O(ac),0x04); /* SRST=1*/
+			for(i=0;i<16;i++) ata_delay400(ac);
+			outb(ATA_DEVCTRL_O(ac),0x00); /* SRST=0*/
+			if (ata_wait(ac,0,ATA_SR_BSY,200000,&ast,0) != 0)
+				return ETIMEDOUT;
+		}
 
-	/* Clear side registers some chips expect 0 */
-	outb(ATA_FEAT_O(ac),    0x00);
-	outb(ATA_SECTCNT_O(ac), 0x00);
-	outb(ATA_SECTNUM_O(ac), 0x00);
+		/* Select device */
+		ata_sel(ac,drive,0);
+		outb(ATA_FEAT_O(ac),    0x00);
+		outb(ATA_SECTCNT_O(ac), 0x00);
+		outb(ATA_SECTNUM_O(ac), 0x00);
 
-	/* Advertise 64KiB burst size (0x0000 is widely compatible) */
-	outb(ATA_CYLLOW_O(ac),  0x00);  /* Byte Count Low  */
-	outb(ATA_CYLHIGH_O(ac), 0x00);  /* Byte Count High */
+		/*
+	 	 * Per DRQ buye count = device block size
+	 	 * ZIP reports 512, CD-ROM 2048. Default to 2048 if unknown
+	 	 */
+		bc = u->atapi_blksz ? u->atapi_blksz : 2048;
+		if (bc==0) bc=2048;
+		outb(ATA_CYLLOW_O(ac),  (u8_t)(bc & 0xff));
+		outb(ATA_CYLHIGH_O(ac), (u8_t)(bc >> 8));
 
-	/* Issue PACKET */
-	outb(ATA_CMD_O(ac), 0xA0);
+		/* Issue PACKET and wait for CDB phase (DRQ=1,BSY=0 */
+		outb(ATA_CMD_O(ac), ATA_CMD_PACKET);
+		ata_delay400(ac); ata_delay400(ac);
+		if (ata_wait(ac,ATA_SR_DRQ,ATA_SR_BSY,200000,&ast,0) != 0) {
+			continue;
+		}
 
-	/* Wait for BSY=0 & DRQ=1 (device ready to accept CDB) */
-	if (ata_wait(ac, ATA_SR_DRQ, ATA_SR_BSY, 200000, 0, 0) != 0) {
-		return ETIMEDOUT;
+		ir = inb(ATA_SECTCNT_O(ac));
+
+		/* Write exactly 12 bytes of CDB (pad to 6 words) */
+		for (i = 0; i < 6; i++) words_cdb[i] = 0; /*bzero*/
+		for (i = 0; i < cdb_len && i < 12; i++)
+			((u8_t *)words_cdb)[i] = cdb[i];
+		outsw(ATA_DATA_O(ac),(u16_t *)words_cdb,6);
+		return 0;
 	}
-	/* Check for ERR/DWF via altstatus */
-	{ u8_t ast, erc; if (ata_err(ac, &ast, &erc)) return EIO; }
-
-	/* Write exactly 12 bytes of CDB (pad to 6 words) */
-	for (i = 0; i < 6; ++i) words_cdb[i] = 0;
-	for (i = 0; i < cdb_len && i < 12; ++i)
-		((u8_t *)words_cdb)[i] = cdb[i];
-
-	outsw(ATA_DATA_O(ac),(u16_t *)words_cdb,6);
-	return 0;
+	return ETIMEDOUT;
 }
 
 int
@@ -544,6 +557,7 @@ ata_probe_unit(ata_ctrl_t *ac, u8_t drive)
 	char 	*klass;
 
 	if (!ac->present) return ENXIO;
+	ATADEBUG(1,"Probe Ctrl %d Unit %d\n",ac->idx,drive);
 
 	/*** Send an CMD_IDENTIFY to force the signature info on the bus ***/
 	outb(ATA_CMD_O(ac), ATA_CMD_IDENTIFY);
@@ -754,7 +768,13 @@ atapi_read10(ata_ctrl_t *ac,u8_t drive,u32_t lba,u16_t nblks,void *buf)
 	cdb[8] = (u8_t)((nblks >> 0) & 0xff);
 
 	/* total transfer size in bytes */
-	xfer = (u32_t)nblks * 2048;
+	xfer = (u32_t)nblks * 
+		(ac->drive[drive]->atapi_blksz ? ac->drive[drive]->atapi_blksz 
+					       : 2048);
+
+	printf("READ10: drive=%d LBA=%lu nblks=%u xfer=%lu blksz=%u\n",
+		drive,lba,nblks,xfer,
+		ac->drive[drive]->atapi_blksz);
 
 	/* send the command */
 	return atapi_packet(ac,drive,cdb,sizeof(cdb),buf,xfer,1,sense,sizeof(sense));
@@ -795,20 +815,22 @@ atapi_mode_sense6(ata_ctrl_t *ac,u8_t drive,u8_t page,u8_t subpage,void *buf,u8_
 int
 atapi_packet(ata_ctrl_t *ac, u8_t drive, u8_t *cdb, int cdb_len, void *buf, u32_t xfer_len, int dir, u8_t *sense, int sense_len)
 {
-	u8_t st, ir, errreg;
-	u16_t bc, wcount, w;
-	u32_t to_xfer;
-	int rc, spins;
+	ata_unit_t *u = ac->drive[drive];
+	u8_t 	st, ir, errreg;
+	u16_t 	bc, wcount, w;
+	u32_t 	to_xfer;
+	int 	rc, spins;
 
 	/* Step 1: send PACKET + CDB */
 	rc = ata_send_packet(ac, drive, cdb, cdb_len);
-	if (rc != 0)
+	if (rc != 0) {
 		goto sense_or_fail;
+	}
 
 	/* Step 2: data/status loop (polled) */
 	for (;;) {
 		/* Wait for BSY to clear */
-		ata_wait(ac, 0, ATA_SR_BSY, 1000000L, &st, 0);
+		ata_wait(ac,0,ATA_SR_BSY,1000000L,&st,0);
 
 		/* If DRQ dropped, command is finishing; read final STATUS */
 		if ((st & ATA_SR_DRQ) == 0) {
@@ -818,67 +840,77 @@ atapi_packet(ata_ctrl_t *ac, u8_t drive, u8_t *cdb, int cdb_len, void *buf, u32_
 				rc = EIO;
 				goto sense_or_fail;
 			}
-			break; /* success */
+			if (xfer_len == 0) break; /* success */
+			continue;
 		}
 
 		/* DRQ asserted: read IReason + ByteCount */
 		ir  = inb(ATA_SECTCNT_O(ac));
 		bc  = inb(ATA_CYLLOW_O(ac));
 		bc |= ((u16_t)inb(ATA_CYLHIGH_O(ac))) << 8;
-		if (bc == 0) bc = 2048;
+		if (bc == 0) {
+			bc = u->atapi_blksz ? u->atapi_blksz : 2048;
+			if (bc == 0) bc=2048;
+		}
 
-		if (dir == 1) {
-			/* Data-in (device -> host), IO bit must be 1 (ir bit1) */
-			if ((ir & 0x02) == 0) { rc = EIO; goto sense_or_fail; }
-
-			to_xfer = (xfer_len < (u32_t)bc) ? xfer_len : (u32_t)bc;
-			wcount  = (u16_t)((to_xfer + 1) >> 1);
+		switch(ir&0x03) {
+		case 0x02:
+			to_xfer = (xfer_len < (u32_t)bc) ? xfer_len:(u32_t)bc;
+			wcount = (u16_t)((to_xfer+1) >> 1);
 
 			insw(ATA_DATA_O(ac),buf,wcount);
-
-			/* Drain any surplus the device sent this burst */
+		
 			if ((u32_t)bc > to_xfer) {
-				u16_t extra = (u16_t)((int)((bc - (u16_t)to_xfer) + 1) >> 1);
+				u16_t extra = (u16_t)(((u32_t)bc-to_xfer+1)>>1);
 				while (extra--) (void)inw(ATA_DATA_O(ac));
 			}
-
 			buf = (void *)((u8_t *)buf + to_xfer);
-			if (xfer_len >= to_xfer) xfer_len -= to_xfer;
+			xfer_len = (xfer_len >= to_xfer)?(xfer_len-to_xfer):0;
 
-		} else if (dir == 0) {
-			/* Data-out (host -> device), IO bit must be 0 */
-			if ((ir & 0x02) != 0) { rc = EIO; goto sense_or_fail; }
+			inb(ATA_ALTSTATUS_O(ac));
+			/*inb(ATA_STATUS_O(ac));*/
+			break;
 
-			to_xfer = (xfer_len < (u32_t)bc) ? xfer_len : (u32_t)bc;
-			wcount  = (u16_t)((to_xfer + 1) >> 1);
+		case 0x00:
+			to_xfer = (xfer_len < (u32_t)bc) ? xfer_len:(u32_t)bc;
+			wcount = (u16_t)((to_xfer+1) >> 1);
 
 			outsw(ATA_DATA_O(ac),buf,wcount);
 
-			/* Pad zeros if device asked for more than we have */
 			if ((u32_t)bc > to_xfer) {
-				u16_t extra2 = (u16_t)((int)((bc - (u16_t)to_xfer) + 1) >> 1);
-				while (extra2--) outw(ATA_DATA_O(ac), 0);
+				u16_t extra2=(u16_t)(((u32_t)bc-to_xfer+1)>>1);
+				while (extra2--) (void)outw(ATA_DATA_O(ac),0);
 			}
-
 			buf = (void *)((u8_t *)buf + to_xfer);
-			if (xfer_len >= to_xfer) xfer_len -= to_xfer;
+			xfer_len = (xfer_len >= to_xfer)?(xfer_len-to_xfer):0;
 
-		} else {
-			/* No-data command but device asserts DRQ: drain */
-			wcount = (u16_t)((int)(bc + 1) >> 1);
-			while (wcount--) (void)inw(ATA_DATA_O(ac));
+			inb(ATA_ALTSTATUS_O(ac));
+			/*inb(ATA_STATUS_O(ac));*/
+			break;
+
+		case 0x01:
+		default:
+			printf("Uknown Phase\n");
+			break;
 		}
 	}
-
+	if (ata_wait(ac,0,ATA_SR_BSY,100000L,&st,0) != 0) {
+		rc=EIO;
+		goto sense_or_fail;
+	}
+	if (st & (ATA_SR_ERR | ATA_SR_DWF)) {
+		rc=EIO;
+		goto sense_or_fail;
+	}
 	return 0;
 
 sense_or_fail:
 	/* Try REQUEST SENSE(6) to report SK/ASC/ASCQ if buffer was provided */
-	if (sense != NULL && sense_len >= 18) {
+	if (sense && sense_len >= 18) {
 		u8_t 	rs_cdb[12];
 		int 	i;
 
-		for (i = 0; i < 12; ++i) rs_cdb[i] = 0;
+		for (i = 0; i < 12; i++) rs_cdb[i] = 0;
 		rs_cdb[0] = CDB_REQUEST_SENSE; /* REQUEST SENSE (6) */
 		rs_cdb[4] = 18;            /* alloc length */
 
@@ -892,10 +924,8 @@ sense_or_fail:
 			for(w=0; w < wds; w++)
 				*(((u16_t *)sense) + w) = inw(ATA_DATA_O(ac));
 			(void)inb(ATA_ALTSTATUS_O(ac));
-		
 		}
 	}
-
 	return (rc != 0) ? rc : EIO;
 }
 
@@ -978,7 +1008,6 @@ ata_softreset_ctrl(ata_ctrl_t *ac)
 
 	ATADEBUG(1,"ata_softreset_ctrl(%d)\n",ac->idx);
 	BUMP(ac,softresets);
-	/*ATA_IRQ_OFF(ac,1);*/
 	AC_CLR_FLAG(ac,ACF_IRQ_ON); /* Clear the flag */
 	outb(ATA_DEVCTRL_O(ac), ATA_CTL_SRST | ATA_CTL_NIEN);
 	drv_usecwait(5);
@@ -1233,11 +1262,17 @@ static	char	buf[50];
 } 
 
 void
-ata_rescue()
+ata_rescue(int ctrl)
 {
 	ata_ctrl_t *ac= &ata_ctrl[1];
 
-	ata_rescue(ac);
+	if (ctrl < 1 || ctrl > 3) {
+		printf("Invalid ctrl\n");
+		return;
+	}
+	ac= &ata_ctrl[ctrl];
+	if (!ac->present) return;
+	ata_rescueit(ac);
 }
 
 void
@@ -1325,4 +1360,24 @@ ata_putblock(dev_t dev, daddr_t blkno, caddr_t buf, u32_t count)
 	rc = (bp->b_flags & B_ERROR) ? EIO : 0;
 	brelse(bp);
 	return rc;
+}
+
+int
+atapi_write10(ata_ctrl_t *ac,u8_t drive,u32_t lba,u16_t nblks,const void *buf)
+{
+	u8_t	cdb[12], sense[18];
+	u32_t	xfer;
+
+	bzero((caddr_t)cdb,sizeof(cdb));
+	cdb[0] = CDB_WRITE_10;
+	cdb[2] = (u8_t)((lba >> 24) & 0xff);
+	cdb[3] = (u8_t)((lba >> 16) & 0xff);
+	cdb[4] = (u8_t)((lba >>  8) & 0xff);
+	cdb[5] = (u8_t)((lba >>  0) & 0xff);
+	cdb[7] = (u8_t)((nblks >> 8) & 0xff);
+	cdb[8] = (u8_t)((nblks >> 0) & 0xff);
+
+	xfer = (u32_t)nblks * (ac->drive[drive]->atapi_blksz ? ac->drive[drive]->atapi_blksz : 2048);
+
+	return atapi_packet(ac,drive,cdb,sizeof(cdb),(void *)buf,xfer,0,sense,sizeof(sense));
 }
